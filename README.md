@@ -1,2 +1,0 @@
-# xiaozhi-google-bridge
-/\
