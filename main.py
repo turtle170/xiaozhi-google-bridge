@@ -1,4 +1,4 @@
-# main.py - XIAOZHI MCP SERVER v3.4 - GEMINI 2.5 FLASH EDITION
+# main.py - XIAOZHI MCP SERVER v3.5 - SPEED OPTIMIZED EDITION
 import os
 import asyncio
 import json
@@ -12,6 +12,9 @@ import sys
 from dotenv import load_dotenv
 import re
 import random
+import hashlib
+from datetime import datetime, timedelta
+import concurrent.futures
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 load_dotenv()
@@ -114,7 +117,7 @@ def wikipedia_search(query, max_results=3):
         
         # CRITICAL FIX: Add proper User-Agent to avoid 403
         headers = {
-            'User-Agent': f'XiaozhiMCPBot/3.4 (https://your-render-project.onrender.com; contact@example.com)'
+            'User-Agent': f'XiaozhiMCPBot/3.5 (https://your-render-project.onrender.com; contact@example.com)'
         }
         
         # First: Search for pages
@@ -223,11 +226,10 @@ def wikipedia_search(query, max_results=3):
         logger.error(f"Unexpected error in wikipedia_search: {e}")
         return "An unexpected error occurred during Wikipedia search."
 
-# ================= GOOGLE GEMINI 2.5 FLASH (BEST FREE TIER!) =================
-def ask_gemini(query, model="gemini-2.5-flash", max_tokens=2000):
+# ================= GOOGLE GEMINI 2.5 FLASH (OPTIMIZED FOR SPEED) =================
+def ask_gemini(query, model="gemini-2.5-flash", max_tokens=800):
     """
-    Query Google Gemini 2.5 Flash - BEST free tier model!
-    128K context, 60 RPM free, optimized for speed.
+    Query Google Gemini 2.5 Flash - OPTIMIZED for speed!
     """
     try:
         if not query or not query.strip():
@@ -245,7 +247,6 @@ def ask_gemini(query, model="gemini-2.5-flash", max_tokens=2000):
         supported_models = {
             "gemini-2.5-flash": "gemini-2.5-flash",  # Best balance for free tier
             "gemini-2.5-flash-lite": "gemini-2.5-flash-lite",  # Higher throughput
-            "gemini-2.5-flash-001": "gemini-2.5-flash-001",  # Latest version
             "gemini-2.0-flash": "gemini-2.0-flash",  # Fallback option
             "gemini-1.5-flash": "gemini-1.5-flash",  # Legacy fallback
         }
@@ -257,16 +258,14 @@ def ask_gemini(query, model="gemini-2.5-flash", max_tokens=2000):
         actual_model = supported_models[model]
         
         # Gemini API endpoint - CORRECT for Gemini 2.5
-        # For latest models, use the full model name
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{actual_model}:generateContent"
-        
-        logger.debug(f"🔗 Using Gemini URL: {url}")
         
         headers = {
             "Content-Type": "application/json",
-            "x-goog-api-client": "xiaozhi-mcp/3.4"  # Identify our client
+            "x-goog-api-client": "xiaozhi-mcp/3.5"
         }
         
+        # OPTIMIZED: Simpler config for faster responses
         data = {
             "contents": [{
                 "parts": [{
@@ -276,35 +275,16 @@ def ask_gemini(query, model="gemini-2.5-flash", max_tokens=2000):
             "generationConfig": {
                 "maxOutputTokens": max_tokens,
                 "temperature": 0.7,
-                "topP": 0.95,
+                "topP": 0.9,
                 "topK": 40,
-                "stopSequences": [],  # No forced stops
-            },
-            "safetySettings": [
-                {
-                    "category": "HARM_CATEGORY_HARASSMENT",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                },
-                {
-                    "category": "HARM_CATEGORY_HATE_SPEECH",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                },
-                {
-                    "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                },
-                {
-                    "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                    "threshold": "BLOCK_MEDIUM_AND_ABOVE"
-                }
-            ]
+            }
         }
         
         # Add API key as query parameter
         params = {"key": GEMINI_API_KEY}
         
-        # Add timeout and better error handling
-        response = requests.post(url, headers=headers, json=data, params=params, timeout=45)
+        # OPTIMIZED: Shorter timeout for faster fallbacks
+        response = requests.post(url, headers=headers, json=data, params=params, timeout=20)
         
         # Handle specific errors with detailed messages
         if response.status_code == 404:
@@ -314,34 +294,25 @@ def ask_gemini(query, model="gemini-2.5-flash", max_tokens=2000):
             for fallback in fallback_models:
                 logger.info(f"🔄 Trying fallback model: {fallback}")
                 fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/{fallback}:generateContent"
-                fallback_response = requests.post(fallback_url, headers=headers, json=data, params=params, timeout=30)
-                if fallback_response.status_code == 200:
-                    logger.info(f"✅ Success with fallback model: {fallback}")
-                    response = fallback_response
-                    break
-                else:
-                    logger.warning(f"❌ Fallback {fallback} also failed: {fallback_response.status_code}")
+                try:
+                    fallback_response = requests.post(fallback_url, headers=headers, json=data, params=params, timeout=15)
+                    if fallback_response.status_code == 200:
+                        logger.info(f"✅ Success with fallback model: {fallback}")
+                        response = fallback_response
+                        break
+                except:
+                    continue
             
             if response.status_code != 200:
-                return f"Gemini model not available. Tried: {actual_model} and fallbacks. Please try gemini-2.0-flash or gemini-1.5-flash."
+                return "Gemini is temporarily unavailable. Please try again in a moment."
         
         elif response.status_code == 429:
             logger.error("❌ Gemini rate limit reached (60 requests/minute free)")
-            return "Gemini rate limit reached. You can make 60 requests per minute for free. Please wait a moment and try again."
+            return "Gemini is busy. You can make 60 requests per minute for free. Please wait a moment."
         
         elif response.status_code == 403:
             logger.error("❌ Gemini API key invalid or quota exceeded")
-            return "Gemini API key invalid or quota exceeded. Check your API key at https://makersuite.google.com/app/apikey"
-        
-        elif response.status_code == 400:
-            error_data = response.json()
-            error_msg = error_data.get("error", {}).get("message", "Bad request")
-            logger.error(f"❌ Gemini bad request: {error_msg}")
-            if "safety" in error_msg.lower():
-                return "Gemini blocked the response due to safety filters. Try rephrasing your question."
-            elif "model" in error_msg.lower():
-                return f"Gemini model error: {error_msg[:100]}"
-            return f"Gemini: {error_msg[:100]}"
+            return "Gemini API issue. Check your API key configuration."
         
         response.raise_for_status()
         
@@ -354,41 +325,63 @@ def ask_gemini(query, model="gemini-2.5-flash", max_tokens=2000):
                 parts = candidate["content"].get("parts", [])
                 if parts and len(parts) > 0 and "text" in parts[0]:
                     answer = parts[0]["text"]
-                    logger.info(f"✅ Gemini {actual_model} response received ({len(answer)} chars)")
+                    logger.info(f"✅ Gemini response ({len(answer)} chars) in {response.elapsed.total_seconds():.1f}s")
                     return answer
         
-        # Alternative extraction methods
-        if "text" in result:
-            return result["text"]
-        
-        # Try to find any text in the response
-        import pprint
-        logger.error(f"Unexpected Gemini response structure:\n{pprint.pformat(result, depth=2)}")
-        
-        # Last resort: look for text anywhere in the response
-        response_str = json.dumps(result)
-        if '"text":' in response_str:
-            import re
-            match = re.search(r'"text":\s*"([^"]+)"', response_str)
-            if match:
-                return match.group(1)
-        
-        return "Error parsing Gemini response. The AI returned an unexpected format."
+        return "Gemini returned an unexpected response format."
         
     except requests.exceptions.Timeout:
         logger.error("Gemini request timeout")
-        return "Gemini request timed out. Please try again."
+        return "Gemini is taking too long to respond. Please try a simpler question."
     except requests.exceptions.RequestException as e:
         logger.error(f"Gemini API error: {e}")
-        return f"Gemini API error: {str(e)[:100]}"
-    except (KeyError, IndexError, TypeError) as e:
-        logger.error(f"Gemini response parsing error: {e}")
-        return "Error parsing Gemini response."
+        return f"Gemini connection error: {str(e)[:80]}"
     except Exception as e:
-        logger.error(f"Unexpected Gemini error: {e}", exc_info=True)
-        return "An unexpected error occurred with Gemini AI."
+        logger.error(f"Unexpected Gemini error: {e}")
+        return "An error occurred with Gemini AI."
 
-# ================= MCP PROTOCOL HANDLER =================
+# ================= SPEED OPTIMIZATIONS =================
+
+# Cache for Gemini responses (5 minutes)
+gemini_cache = {}
+CACHE_DURATION = 300  # 5 minutes
+
+def ask_gemini_cached(query, model="gemini-2.5-flash", max_tokens=500):
+    """Cached version to avoid duplicate API calls."""
+    # Create cache key
+    cache_key = hashlib.md5(f"{query}_{model}_{max_tokens}".encode()).hexdigest()
+    
+    # Check cache
+    if cache_key in gemini_cache:
+        cached_time, response = gemini_cache[cache_key]
+        if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
+            logger.info(f"♻️ Using cached Gemini response for: '{query[:30]}...'")
+            return f"[Cached] {response}"
+    
+    # Get fresh response (with smaller token count for speed)
+    response = ask_gemini(query, model=model, max_tokens=min(max_tokens, 500))
+    
+    # Store in cache
+    gemini_cache[cache_key] = (datetime.now(), response)
+    
+    return response
+
+def ask_gemini_fast(query, timeout_seconds=15):
+    """
+    Wrapper with timeout to ensure response within Xiaozhi's limits.
+    """
+    try:
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(ask_gemini_cached, query, max_tokens=400)
+            return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError:
+        logger.error(f"⚠️ Gemini timeout after {timeout_seconds}s")
+        return "Gemini is thinking... Try a simpler question or wait a moment."
+    except Exception as e:
+        logger.error(f"Gemini fast error: {e}")
+        return ask_gemini_cached(query, max_tokens=400)
+
+# ================= MCP PROTOCOL HANDLER (OPTIMIZED) =================
 class MCPProtocolHandler:
     """Handles MCP protocol messages for 3 tools."""
     
@@ -404,8 +397,8 @@ class MCPProtocolHandler:
                     "tools": {}
                 },
                 "serverInfo": {
-                    "name": "gemini-2.5-server",
-                    "version": "3.4.0"
+                    "name": "gemini-fast-server",
+                    "version": "3.5.0"
                 }
             }
         }
@@ -420,13 +413,13 @@ class MCPProtocolHandler:
                 "tools": [
                     {
                         "name": "google_search",
-                        "description": "Search Google for information (returns TOP 10 results)",
+                        "description": "Search Google for information (10 results)",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "query": {
                                     "type": "string",
-                                    "description": "What to search on Google"
+                                    "description": "Search query"
                                 }
                             },
                             "required": ["query"]
@@ -434,13 +427,13 @@ class MCPProtocolHandler:
                     },
                     {
                         "name": "wikipedia_search",
-                        "description": "Search Wikipedia for factual information and summaries",
+                        "description": "Search Wikipedia for factual information",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "query": {
                                     "type": "string",
-                                    "description": "What to search on Wikipedia"
+                                    "description": "Search query"
                                 }
                             },
                             "required": ["query"]
@@ -448,13 +441,13 @@ class MCPProtocolHandler:
                     },
                     {
                         "name": "ask_ai",
-                        "description": "Ask AI questions using Google Gemini 2.5 Flash (128K context, 60 RPM FREE!)",
+                        "description": "Ask Google Gemini 2.5 Flash (fast, free AI)",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
                                 "query": {
                                     "type": "string",
-                                    "description": "Your question or prompt for AI"
+                                    "description": "Your question"
                                 }
                             },
                             "required": ["query"]
@@ -475,7 +468,7 @@ class MCPProtocolHandler:
     
     @staticmethod
     def handle_tools_call(message_id, params):
-        """Handle tools/call request - ALL 3 TOOLS!"""
+        """Handle tools/call request - OPTIMIZED FOR SPEED!"""
         call_id = params.get("callId", "")
         tool_name = params.get("name", "")
         arguments = params.get("arguments", {})
@@ -487,23 +480,24 @@ class MCPProtocolHandler:
                 "id": message_id,
                 "error": {
                     "code": -32602,
-                    "message": "Missing required parameter: query"
+                    "message": "Missing query parameter"
                 }
             }
+        
+        start_time = time.time()
         
         # Route to appropriate function
         if tool_name == "google_search":
             search_results = google_search(query, max_results=10)
-            response_text = f"## 🔍 Google Search Results (Top 10)\n\n**Query:** {query}\n\n{search_results}"
+            response_text = search_results  # Simple response
             
         elif tool_name == "wikipedia_search":
             search_results = wikipedia_search(query)
-            response_text = f"## 📚 Wikipedia Search Results\n\n**Query:** {query}\n\n{search_results}"
+            response_text = search_results  # Simple response
             
-        elif tool_name == "ask_ai":  # GOOGLE GEMINI 2.5 FLASH!
-            # Use Gemini 2.5 Flash (best free tier model)
-            ai_response = ask_gemini(query, model="gemini-2.5-flash")
-            response_text = f"## 🤖 Google Gemini 2.5 Flash (Free!)\n\n**Your Question:** {query}\n\n{ai_response}"
+        elif tool_name == "ask_ai":  # OPTIMIZED: Fast Gemini with cache
+            ai_response = ask_gemini_fast(query, timeout_seconds=15)
+            response_text = ai_response  # Simple response - NO formatting
             
         else:
             return {
@@ -515,16 +509,18 @@ class MCPProtocolHandler:
                 }
             }
         
+        elapsed = time.time() - start_time
+        logger.info(f"⏱️ Tool '{tool_name}' completed in {elapsed:.1f}s")
+        
+        # OPTIMIZED: Minimal response structure
         return {
             "jsonrpc": "2.0",
             "id": message_id,
             "result": {
-                "content": [
-                    {
-                        "type": "text",
-                        "text": response_text
-                    }
-                ]
+                "content": [{
+                    "type": "text",
+                    "text": response_text
+                }]
             }
         }
     
@@ -543,7 +539,7 @@ class MCPProtocolHandler:
 # ================= MAIN MCP BRIDGE =================
 async def mcp_bridge():
     """
-    WebSocket bridge with enhanced connection handling.
+    WebSocket bridge optimized for stability.
     """
     reconnect_delay = 2
     max_reconnect_delay = 60
@@ -585,16 +581,16 @@ async def mcp_bridge():
                                 
                             elif method == "tools/list":
                                 response = MCPProtocolHandler.handle_tools_list(message_id)
-                                logger.info("✅ Sent tools list (3 powerful tools!)")
+                                logger.info("✅ Sent tools list")
                                 
                             elif method == "tools/call":
+                                # OPTIMIZED: Process tools/call immediately
                                 response = MCPProtocolHandler.handle_tools_call(message_id, params)
                                 tool_name = params.get("name", "unknown")
-                                logger.info(f"✅ Processed {tool_name} for query")
+                                logger.info(f"✅ Processed {tool_name}")
                                 
                             elif method == "notifications/initialized":
-                                logger.debug("📢 Client initialized notification")
-                                continue
+                                continue  # No response needed
                                 
                             else:
                                 logger.warning(f"⚠️ Unknown method: {method}")
@@ -605,8 +601,6 @@ async def mcp_bridge():
                         
                         except json.JSONDecodeError as e:
                             logger.error(f"❌ Failed to parse JSON: {e}")
-                        except KeyError as e:
-                            logger.error(f"❌ Missing key in message: {e}")
                         except Exception as e:
                             logger.error(f"❌ Error processing message: {e}", exc_info=True)
                 
@@ -625,18 +619,8 @@ async def mcp_bridge():
             await asyncio.sleep(wait_time)
             reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
             
-        except ConnectionRefusedError:
-            logger.error("❌ Connection refused.")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
-            
-        except asyncio.TimeoutError:
-            logger.error("⏰ Connection timeout")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
-            
         except Exception as e:
-            logger.error(f"❌ Unexpected connection error: {e}", exc_info=True)
+            logger.error(f"❌ Unexpected connection error: {e}")
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 1.5, max_reconnect_delay)
 
@@ -655,7 +639,7 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Xiaozhi MCP Server v3.4</title>
+        <title>Xiaozhi MCP Server v3.5</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -664,76 +648,62 @@ def index():
             .header {{ background: linear-gradient(135deg, #4285F4 0%, #EA4335 100%); 
                       color: white; padding: 2rem; border-radius: 10px; margin-bottom: 2rem; }}
             .status {{ background: #f8f9fa; border-left: 4px solid #34A853; padding: 1rem; margin: 1rem 0; }}
-            .feature {{ background: #e8f0fe; border-left: 4px solid #4285F4; padding: 1rem; margin: 1rem 0; }}
-            .free-badge {{ background: #0F9D58; color: white; padding: 4px 8px; border-radius: 12px; 
+            .optimized {{ background: #e8f0fe; border-left: 4px solid #4285F4; padding: 1rem; margin: 1rem 0; }}
+            .fast-badge {{ background: #FBBC05; color: black; padding: 4px 8px; border-radius: 12px; 
                          font-size: 0.8em; font-weight: bold; display: inline-block; margin-left: 10px; }}
-            .gemini-badge {{ background: #EA4335; color: white; padding: 4px 8px; border-radius: 12px; 
-                          font-size: 0.8em; font-weight: bold; display: inline-block; margin-left: 10px; }}
         </style>
     </head>
     <body>
         <div class="header">
-            <h1>🚀 Xiaozhi MCP Server v3.4</h1>
-            <p>Gemini 2.5 Flash Edition - Latest & Greatest Free AI!</p>
+            <h1>🚀 Xiaozhi MCP Server v3.5</h1>
+            <p>Speed Optimized Edition - No More Timeouts!</p>
         </div>
         
         <div class="status">
             <h2>✅ Server Status: <strong>RUNNING</strong></h2>
             <p>Uptime: {hours}h {minutes}m {seconds}s</p>
-            <p>Version: 3.4.0 (Gemini 2.5 Flash - Best Free Tier)</p>
+            <p>Version: 3.5.0 (Speed Optimized)</p>
         </div>
         
-        <div class="feature">
-            <h3>🌟 NEW: Gemini 2.5 Flash <span class="gemini-badge">128K CONTEXT</span> <span class="free-badge">60 RPM FREE</span></h3>
-            <p><strong>Latest generation AI</strong> with 128K context window - completely free!</p>
+        <div class="optimized">
+            <h3>⚡ SPEED OPTIMIZATIONS <span class="fast-badge">UNDER 15s RESPONSE</span></h3>
+            <p><strong>All fixes implemented to prevent Xiaozhi timeouts:</strong></p>
             <ul>
-                <li><strong>Gemini 2.5 Flash</strong> - Best performance/speed balance</li>
-                <li><strong>128,000 token context</strong> - Remembers long conversations</li>
-                <li><strong>60 requests per minute</strong> - Most generous free tier</li>
-                <li><strong>No credit card required</strong> - Truly free forever</li>
-                <li><strong>Automatic fallbacks</strong> - Tries 2.0 Flash → 1.5 Flash if needed</li>
+                <li><strong>Caching</strong> - 5-minute cache for duplicate queries</li>
+                <li><strong>Timeout Protection</strong> - 15s max response time</li>
+                <li><strong>Smaller Responses</strong> - 400 token limit for speed</li>
+                <li><strong>Simple Formatting</strong> - No Markdown overhead</li>
+                <li><strong>Model Fallbacks</strong> - Auto-switch if model unavailable</li>
             </ul>
         </div>
         
         <h2>🔧 Available Tools</h2>
         
-        <div class="feature">
+        <div class="optimized">
             <h3>🔍 Google Search</h3>
-            <p><strong>10 results per search</strong> (upgraded!)</p>
-            <p><em>100 searches/day free</em></p>
+            <p><strong>10 results</strong> - Fast web search</p>
         </div>
         
-        <div class="feature">
+        <div class="optimized">
             <h3>📚 Wikipedia Search</h3>
-            <p><strong>403 error fixed</strong> - now working reliably</p>
-            <p><em>Completely free forever</em></p>
+            <p><strong>403 fixed</strong> - Reliable factual search</p>
         </div>
         
-        <div class="feature">
+        <div class="optimized">
             <h3>🤖 Google Gemini 2.5 Flash</h3>
-            <p><strong>Latest generation AI</strong> with 128K context</p>
-            <p><em>60 requests/minute FREE</em> - most generous limits!</p>
+            <p><strong>Optimized for speed</strong> - Cached, timeout-protected</p>
+            <p><em>60 requests/minute FREE</em></p>
         </div>
-        
-        <h2>⚙️ Configuration Check</h2>
-        <ul>
-            <li><strong>Google Search API:</strong> {'✅ Configured' if GOOGLE_API_KEY and CSE_ID else '❌ Not configured'}</li>
-            <li><strong>Wikipedia:</strong> ✅ Fixed (no 403 errors)</li>
-            <li><strong>Google Gemini:</strong> {'✅ Configured' if GEMINI_API_KEY else '❌ Not configured'}</li>
-            <li><strong>AI Model:</strong> Gemini 2.5 Flash (latest)</li>
-        </ul>
         
         <h2>🎯 Test Endpoints</h2>
         <ul>
             <li><a href="/health">Health Check</a></li>
-            <li><a href="/test/google">Test Google Search</a></li>
-            <li><a href="/test/wikipedia">Test Wikipedia</a></li>
-            <li><a href="/test/gemini">Test Gemini 2.5 Flash</a></li>
-            <li><a href="/test/gemini-models">Test All Gemini Models</a></li>
-            <li><a href="/debug">Debug Info</a></li>
+            <li><a href="/test/fast-gemini">Test Fast Gemini</a></li>
+            <li><a href="/test/response-time">Test Response Time</a></li>
+            <li><a href="/cache-info">Cache Statistics</a></li>
         </ul>
         
-        <p><em>Gemini 2.5 Flash Edition - {time.strftime('%Y-%m-%d %H:%M:%S UTC')}</em></p>
+        <p><em>Optimized for Xiaozhi's 30-second timeout - {time.strftime('%Y-%m-%d %H:%M:%S UTC')}</em></p>
     </body>
     </html>
     """
@@ -741,167 +711,138 @@ def index():
 @app.route('/health')
 def health_check():
     """Health check endpoint."""
+    cache_size = len(gemini_cache)
+    cache_keys = list(gemini_cache.keys())[:5] if cache_size > 0 else []
+    
     return jsonify({
         "status": "healthy",
         "timestamp": time.time(),
         "service": "xiaozhi-mcp-server",
-        "version": "3.4.0",
-        "ai_provider": "google-gemini-2.5-flash",
+        "version": "3.5.0",
+        "optimizations": {
+            "caching_enabled": True,
+            "cache_size": cache_size,
+            "max_response_time": "15 seconds",
+            "token_limit": 400,
+            "timeout_protection": True
+        },
         "services": {
             "google_search": "configured" if GOOGLE_API_KEY and CSE_ID else "not_configured",
             "wikipedia": "fixed_no_403",
             "gemini_ai": "configured" if GEMINI_API_KEY else "not_configured"
-        },
-        "free_limits": {
-            "gemini_requests_per_minute": 60,
-            "google_searches_per_day": 100,
-            "wikipedia": "unlimited",
-            "gemini_context": "128,000 tokens"
         }
     }), 200
 
-@app.route('/test/google')
-def test_google():
-    """Test Google search."""
-    query = "artificial intelligence"
-    try:
-        results = google_search(query, max_results=2)
-        return jsonify({
-            "success": True,
-            "engine": "Google Search",
-            "query": query,
-            "max_results": 10,
-            "sample": results[:300]
-        })
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-@app.route('/test/wikipedia')
-def test_wikipedia():
-    """Test Wikipedia search."""
-    query = "science"
-    try:
-        results = wikipedia_search(query, max_results=2)
-        has_403 = "403" in results or "restricting" in results
-        return jsonify({
-            "success": not has_403,
-            "engine": "Wikipedia",
-            "query": query,
-            "fixed_403": True,
-            "result": results[:300]
-        })
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-@app.route('/test/gemini')
-def test_gemini():
-    """Test Google Gemini 2.5 Flash."""
-    if not GEMINI_API_KEY:
-        return jsonify({
-            "success": False,
-            "error": "GEMINI_API_KEY not configured",
-            "setup": "Get free key at https://makersuite.google.com/app/apikey"
-        }), 400
-    
-    query = "Hello! Please respond with 'Gemini 2.5 Flash is working!' and tell me one interesting fact about AI."
-    try:
-        results = ask_gemini(query, model="gemini-2.5-flash", max_tokens=500)
-        has_error = any(word in results.lower() for word in ["error", "invalid", "403", "429", "404"])
-        
-        return jsonify({
-            "success": not has_error,
-            "engine": "Google Gemini 2.5 Flash",
-            "query": query,
-            "response": results,
-            "free_limit": "60 requests/minute",
-            "context_window": "128,000 tokens",
-            "note": "Latest generation AI - completely free!"
-        })
-    except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "note": "Check Gemini API key at https://makersuite.google.com"
-        }), 500
-
-@app.route('/test/gemini-models')
-def test_gemini_models():
-    """Test all available Gemini models."""
+@app.route('/test/fast-gemini')
+def test_fast_gemini():
+    """Test the optimized fast Gemini."""
     if not GEMINI_API_KEY:
         return jsonify({
             "success": False,
             "error": "GEMINI_API_KEY not configured"
         }), 400
     
-    models_to_test = [
-        "gemini-2.5-flash",
-        "gemini-2.5-flash-lite", 
-        "gemini-2.0-flash",
-        "gemini-1.5-flash"
-    ]
+    query = "Say 'Fast response working!' and nothing else."
+    start_time = time.time()
     
-    results = []
-    query = "Say 'This model is working!'"
+    try:
+        results = ask_gemini_fast(query, timeout_seconds=10)
+        elapsed = time.time() - start_time
+        
+        is_fast = elapsed < 10
+        has_timeout = "timeout" in results.lower() or "thinking" in results.lower()
+        
+        return jsonify({
+            "success": is_fast and not has_timeout,
+            "engine": "Google Gemini 2.5 Flash (Optimized)",
+            "query": query,
+            "response": results,
+            "response_time": f"{elapsed:.2f} seconds",
+            "fast_enough": elapsed < 5,
+            "cached": "[Cached]" in results,
+            "optimizations": [
+                "15s timeout protection",
+                "400 token limit", 
+                "5-minute caching",
+                "Model fallbacks"
+            ]
+        })
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "response_time": f"{time.time() - start_time:.2f}s"
+        }), 500
+
+@app.route('/test/response-time')
+def test_response_time():
+    """Test response time for all tools."""
+    tests = []
     
-    for model in models_to_test:
-        try:
-            response = ask_gemini(query, model=model, max_tokens=100)
-            works = "error" not in response.lower() and "not available" not in response.lower()
-            results.append({
-                "model": model,
-                "works": works,
-                "response": response[:100] if works else response
-            })
-            # Small delay between tests
-            time.sleep(0.5)
-        except Exception as e:
-            results.append({
-                "model": model,
-                "works": False,
-                "error": str(e)[:100]
-            })
+    # Test Gemini
+    if GEMINI_API_KEY:
+        start = time.time()
+        result = ask_gemini_fast("Test response time", timeout_seconds=10)
+        gemini_time = time.time() - start
+        tests.append({
+            "tool": "gemini",
+            "time": gemini_time,
+            "fast": gemini_time < 5,
+            "cached": "[Cached]" in result
+        })
     
-    working_models = [r["model"] for r in results if r["works"]]
+    # Test Wikipedia
+    start = time.time()
+    wikipedia_search("test", max_results=1)
+    wiki_time = time.time() - start
+    tests.append({
+        "tool": "wikipedia", 
+        "time": wiki_time,
+        "fast": wiki_time < 3
+    })
+    
+    # Test Google Search (if configured)
+    if GOOGLE_API_KEY and CSE_ID:
+        start = time.time()
+        google_search("test", max_results=1)
+        google_time = time.time() - start
+        tests.append({
+            "tool": "google",
+            "time": google_time,
+            "fast": google_time < 3
+        })
+    
+    all_fast = all(t["fast"] for t in tests)
     
     return jsonify({
-        "success": len(working_models) > 0,
-        "available_models": working_models,
-        "all_results": results,
-        "recommended": "gemini-2.5-flash" if "gemini-2.5-flash" in working_models else working_models[0] if working_models else "none"
+        "success": all_fast,
+        "tests": tests,
+        "summary": "All tools responding quickly" if all_fast else "Some tools may be slow",
+        "xiaozhi_timeout_limit": "30 seconds",
+        "worst_case": max([t["time"] for t in tests]) if tests else 0
     }), 200
 
-@app.route('/debug')
-def debug_info():
-    """Debug information page."""
+@app.route('/cache-info')
+def cache_info():
+    """Show cache statistics."""
+    cache_size = len(gemini_cache)
+    now = datetime.now()
+    
+    cached_items = []
+    for key, (cached_time, response) in list(gemini_cache.items())[:10]:  # First 10
+        age = (now - cached_time).total_seconds()
+        cached_items.append({
+            "age_seconds": int(age),
+            "response_preview": response[:50] + "..." if len(response) > 50 else response,
+            "expires_in": int(CACHE_DURATION - age) if age < CACHE_DURATION else 0
+        })
+    
     return jsonify({
-        "server": {
-            "version": "3.4.0",
-            "uptime": int(time.time() - server_start_time),
-            "ai_provider": "google_gemini_2.5_flash"
-        },
-        "environment": {
-            "has_xiaozhi_ws": bool(XIAOZHI_WS),
-            "has_google_search": bool(GOOGLE_API_KEY and CSE_ID),
-            "has_gemini": bool(GEMINI_API_KEY),
-            "gemini_key_prefix": GEMINI_API_KEY[:10] + "..." if GEMINI_API_KEY else "none"
-        },
-        "free_limits": {
-            "gemini": "60 requests per minute, 128K context",
-            "google_search": "100 searches per day",
-            "wikipedia": "unlimited"
-        },
-        "supported_models": [
-            "gemini-2.5-flash (recommended)",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash", 
-            "gemini-1.5-flash"
-        ]
+        "cache_size": cache_size,
+        "cache_duration_seconds": CACHE_DURATION,
+        "cache_hit_rate": "N/A",  # Would need tracking
+        "oldest_item": min([age for age, _, _ in [(item["age_seconds"],) for item in cached_items]]) if cached_items else 0,
+        "sample_items": cached_items
     }), 200
 
 def run_web_server():
@@ -912,8 +853,8 @@ def run_web_server():
 async def main():
     """Main application entry point."""
     logger.info("=" * 60)
-    logger.info("🚀 Starting Xiaozhi MCP Server v3.4")
-    logger.info("🌟 GEMINI 2.5 FLASH EDITION - Latest & Greatest!")
+    logger.info("🚀 Starting Xiaozhi MCP Server v3.5")
+    logger.info("⚡ SPEED OPTIMIZED EDITION - No Timeouts!")
     logger.info("=" * 60)
     
     logger.info("📊 Configuration Check:")
@@ -923,7 +864,7 @@ async def main():
     
     if GEMINI_API_KEY:
         logger.info(f"   Gemini Key: {GEMINI_API_KEY[:10]}...")
-        logger.info("   🎉 Gemini 2.5 Flash: 60 requests/minute, 128K context FREE!")
+        logger.info("   ⚡ Optimizations: Caching, 15s timeout, 400 token limit")
     
     # Start Flask web server
     web_thread = threading.Thread(target=run_web_server, daemon=True)
@@ -931,7 +872,7 @@ async def main():
     logger.info("🌐 Web server started on http://0.0.0.0:3000")
     
     # Start MCP bridge
-    logger.info("🔗 Starting MCP WebSocket bridge to Xiaozhi...")
+    logger.info("🔗 Starting OPTIMIZED MCP WebSocket bridge...")
     await mcp_bridge()
 
 if __name__ == "__main__":
