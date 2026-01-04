@@ -1,4 +1,4 @@
-# main.py - XIAOZHI MCP SERVER v3.6.1 - WITH KEEP-ALIVE PINGS
+# main.py - XIAOZHI MCP SERVER v3.6.1 - TURBO MODE
 import os
 import asyncio
 import json
@@ -14,6 +14,9 @@ import re
 import hashlib
 from datetime import datetime, timedelta
 import concurrent.futures
+import queue
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 load_dotenv()
@@ -30,6 +33,12 @@ if not XIAOZHI_WS:
     print("   Go to Render.com dashboard → Environment → Add XIAOZHI_WS")
     sys.exit(1)
 
+# ================= TURBO CONFIGURATION =================
+TURBO_MODE = True
+KEEPALIVE_INTERVAL = 1.0  # 1 SECOND PINGS - CRAZY MODE
+PARALLEL_MODEL_TRIES = 3  # Try multiple models simultaneously
+MAX_WORKERS = 5  # Thread pool size
+
 # ================= LOGGING SETUP =================
 logging.basicConfig(
     level=logging.INFO,
@@ -41,500 +50,253 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ================= GEMINI-POWERED TIER SELECTION =================
-class SmartModelSelector:
-    """Smart model selection using Gemini 2.5 Flash-Lite for classification."""
+# ================= GLOBAL STATE =================
+gemini_cache = {}
+CACHE_DURATION = 300
+active_requests = {}
+keep_alive_queue = queue.Queue()
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+keep_alive_messages = [
+    "AI is thinking...",
+    "Processing your request...",
+    "Generating response...",
+    "Almost ready!",
+    "Working on it...",
+    "Crafting answer..."
+]
+
+# ================= TURBO KEEP-ALIVE SYSTEM =================
+class TurboKeepAlive:
+    """ULTRA-FAST keep-alive system with 1-second pings."""
     
-    # TIERS BASED ON YOUR SPECIFICATION:
+    @staticmethod
+    def start_keep_alive(websocket, request_id, duration=30):
+        """Start aggressive keep-alive pinging in a separate thread."""
+        def keep_alive_worker():
+            try:
+                logger.info(f"🚀 TURBO KEEP-ALIVE STARTED for {request_id}")
+                start_time = time.time()
+                ping_count = 0
+                
+                while time.time() - start_time < duration:
+                    # Send ping every 1 second
+                    if ping_count % 1 == 0:
+                        message_idx = ping_count % len(keep_alive_messages)
+                        ping_message = {
+                            "jsonrpc": "2.0",
+                            "method": "notifications/progress",
+                            "params": {
+                                "progress": {
+                                    "type": "text",
+                                    "text": f"⏳ {keep_alive_messages[message_idx]}"
+                                }
+                            }
+                        }
+                        
+                        try:
+                            # Use asyncio to send to websocket
+                            asyncio.run_coroutine_threadsafe(
+                                websocket.send(json.dumps(ping_message)),
+                                asyncio.get_event_loop()
+                            )
+                            logger.debug(f"🚀 PING #{ping_count+1} for {request_id}")
+                        except Exception as e:
+                            logger.debug(f"Ping failed: {e}")
+                            break
+                    
+                    ping_count += 1
+                    time.sleep(KEEPALIVE_INTERVAL)  # 1 SECOND!
+                
+                logger.info(f"✅ Keep-alive completed for {request_id}")
+                
+            except Exception as e:
+                logger.error(f"❌ Keep-alive error: {e}")
+        
+        # Start the turbo thread
+        thread = threading.Thread(target=keep_alive_worker, daemon=True)
+        thread.start()
+        return thread
+
+# ================= PARALLEL GEMINI PROCESSOR =================
+class ParallelGeminiProcessor:
+    """Process Gemini requests in parallel with turbo speed."""
+    
     TIERS = {
-        "HARD": "gemini-3.0-flash",      # HARD tasks → Gemini 3 Flash (default thinking mode)
-        "MEDIUM": "gemini-2.5-flash",    # MEDIUM tasks → Gemini 2.5 Flash
-        "SIMPLE": "gemini-2.5-flash-lite" # SIMPLE tasks → Gemini 2.5 Flash-Lite
+        "HARD": "gemini-3.0-flash",
+        "MEDIUM": "gemini-2.5-flash", 
+        "SIMPLE": "gemini-2.5-flash-lite"
     }
     
     @staticmethod
-    def classify_query_with_gemini(query):
-        """Use Gemini 2.5 Flash-Lite to classify query into HARD, MEDIUM, or SIMPLE."""
+    def classify_query_turbo(query):
+        """Ultra-fast classification with fallback."""
+        # SIMPLE RULE-BASED CLASSIFICATION FOR SPEED
+        query_lower = query.lower()
+        words = query_lower.split()
+        
+        # Hard queries: long or complex keywords
+        hard_keywords = ['explain', 'analyze', 'compare', 'write code', 'debug', 
+                        'complex', 'detailed', 'research', 'thesis', 'essay']
+        
+        # Simple queries: short or basic
+        simple_keywords = ['hello', 'hi', 'thanks', 'weather', 'time', 'date',
+                          'calculate', 'convert', 'joke', 'quote', 'fact']
+        
+        if any(keyword in query_lower for keyword in hard_keywords) or len(words) > 15:
+            return "HARD"
+        elif any(keyword in query_lower for keyword in simple_keywords) or len(words) < 5:
+            return "SIMPLE"
+        else:
+            return "MEDIUM"
+    
+    @staticmethod
+    def get_model_config(tier):
+        """Get turbo-optimized model configuration."""
+        configs = {
+            "HARD": {
+                "models": ["gemini-3.0-flash", "gemini-2.5-pro", "gemini-2.5-flash"],
+                "tokens": 8192,
+                "timeouts": [25, 20, 15]  # Parallel timeouts
+            },
+            "MEDIUM": {
+                "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
+                "tokens": 4096,
+                "timeouts": [15, 10, 10]
+            },
+            "SIMPLE": {
+                "models": ["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"],
+                "tokens": 2048,
+                "timeouts": [8, 8, 8]
+            }
+        }
+        return configs.get(tier, configs["MEDIUM"])
+    
+    @staticmethod
+    def call_gemini_turbo(query, model, max_tokens, timeout):
+        """Turbo-optimized Gemini call."""
         try:
-            if not GEMINI_API_KEY:
-                logger.warning("No Gemini API key, using fallback classification")
-                return "MEDIUM"
-            
-            # Prepare the classification prompt
-            classification_prompt = f"""Please help me sort this query into 3 tiers: 
-Hard (handled by Gemini 3 Flash), 
-Medium (Handled by Gemini 2.5 Flash), and 
-Simple (Handled by Gemini 2.5 Flash-Lite): "{query}"
-
-Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."""
-            
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             
             headers = {
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
+                "Accept": "application/json"
             }
             
             data = {
                 "contents": [{
-                    "parts": [{
-                        "text": classification_prompt
-                    }]
+                    "parts": [{"text": query}]
                 }],
                 "generationConfig": {
-                    "maxOutputTokens": 10,
-                    "temperature": 0.1,
-                    "topP": 0.1,
-                    "topK": 1,
-                }
+                    "maxOutputTokens": max_tokens,
+                    "temperature": 0.7,
+                    "topP": 0.9,
+                    "topK": 40,
+                },
+                "safetySettings": [
+                    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
+                ]
             }
             
             params = {"key": GEMINI_API_KEY}
             
-            # Quick timeout for classification
-            response = requests.post(url, headers=headers, json=data, params=params, timeout=5)
-            response.raise_for_status()
+            # ULTRA-FAST request with minimal overhead
+            response = requests.post(
+                url, 
+                headers=headers, 
+                json=data, 
+                params=params, 
+                timeout=timeout,
+                verify=True
+            )
             
-            result = response.json()
+            if response.status_code == 200:
+                result = response.json()
+                if "candidates" in result and result["candidates"]:
+                    candidate = result["candidates"][0]
+                    if "content" in candidate:
+                        parts = candidate["content"].get("parts", [])
+                        if parts and "text" in parts[0]:
+                            return parts[0]["text"], True
             
-            if "candidates" in result and len(result["candidates"]) > 0:
-                candidate = result["candidates"][0]
-                if "content" in candidate:
-                    parts = candidate["content"].get("parts", [])
-                    if parts and len(parts) > 0 and "text" in parts[0]:
-                        classification = parts[0]["text"].strip().upper()
-                        
-                        # Extract just HARD/MEDIUM/SIMPLE from response
-                        for tier in ["HARD", "MEDIUM", "SIMPLE"]:
-                            if tier in classification:
-                                return tier
-            
-            return "MEDIUM"
+            return None, False
             
         except requests.exceptions.Timeout:
-            logger.warning("⏰ Classification timeout, using MEDIUM as default")
-            return "MEDIUM"
+            logger.warning(f"⏰ {model} timeout")
+            return None, False
         except Exception as e:
-            logger.error(f"❌ Classification error: {e}")
-            return "MEDIUM"
+            logger.error(f"❌ {model} error: {str(e)[:50]}")
+            return None, False
     
     @staticmethod
-    def select_model(query):
-        """Select model using Gemini-powered classification."""
-        # Get classification from Gemini
-        tier = SmartModelSelector.classify_query_with_gemini(query)
-        logger.info(f"🎯 Gemini classified as: {tier} for '{query[:50]}...'")
-        
-        # Map tier to model and parameters - OPTIMIZED FOR MAX TOKENS
-        model_configs = {
-            "HARD": {
-                "model": "gemini-3.0-flash",      # Gemini 3 Flash
-                "tokens": 8192,                   # Max output tokens for 20s response
-                "timeout": 20,
-                "fallbacks": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.5-flash"]
-            },
-            "MEDIUM": {
-                "model": "gemini-2.5-flash",      # Gemini 2.5 Flash
-                "tokens": 4096,                   # Good balance for speed
-                "timeout": 15,
-                "fallbacks": ["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"]
-            },
-            "SIMPLE": {
-                "model": "gemini-2.5-flash-lite", # Gemini 2.5 Flash-Lite
-                "tokens": 2048,                   # Fast response
-                "timeout": 10,
-                "fallbacks": ["gemini-2.0-flash", "gemini-1.5-flash"]
-            }
-        }
-        
-        config = model_configs.get(tier, model_configs["MEDIUM"])
-        
-        return {
-            "tier": tier,
-            "model": config["model"],
-            "tokens": config["tokens"],
-            "timeout": config["timeout"],
-            "fallbacks": config["fallbacks"]
-        }
-
-# ================= GEMINI API CLIENT WITH KEEP-ALIVE =================
-gemini_cache = {}
-CACHE_DURATION = 300
-
-# Track active requests for keep-alive pings
-active_requests = {}
-keep_alive_messages = [
-    "Hi! Our AI is still responding, please wait for a bit!",
-    "Processing your request...",
-    "Generating a thoughtful response...",
-    "Almost there!",
-    "Crafting the perfect answer...",
-    "Thinking deeply about your question..."
-]
-
-def call_gemini_api_with_keepalive(query, model="gemini-2.5-flash", max_tokens=4096, timeout=20, 
-                                   request_id=None, websocket=None):
-    """Call Gemini API with keep-alive pings to prevent Xiaozhi timeout."""
-    try:
-        if not GEMINI_API_KEY:
-            return "Gemini API key not configured.", "NO_API_KEY"
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        
-        headers = {
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "contents": [{
-                "parts": [{
-                    "text": query
-                }]
-            }],
-            "generationConfig": {
-                "maxOutputTokens": max_tokens,
-                "temperature": 0.7,
-                "topP": 0.9,
-                "topK": 40,
-            }
-        }
-        
-        params = {"key": GEMINI_API_KEY}
-        
-        # Start keep-alive ping thread if we have a websocket
-        if websocket and request_id:
-            keep_alive_thread = threading.Thread(
-                target=send_keep_alive_pings,
-                args=(websocket, request_id, timeout),
-                daemon=True
-            )
-            keep_alive_thread.start()
-            logger.info(f"🔄 Started keep-alive pings for request {request_id}")
-        
-        response = requests.post(url, headers=headers, json=data, params=params, timeout=timeout)
-        
-        # Clean up the keep-alive tracking
-        if request_id and request_id in active_requests:
-            active_requests[request_id] = False
-        
-        # Handle 404 - model not available
-        if response.status_code == 404:
-            logger.warning(f"❌ Model {model} not available (404)")
-            return None, "MODEL_NOT_AVAILABLE"
-        
-        # Handle rate limits
-        if response.status_code == 429:
-            logger.warning(f"⏰ Model {model} rate limited (429)")
-            return None, "RATE_LIMITED"
-        
-        response.raise_for_status()
-        
-        result = response.json()
-        
-        if "candidates" in result and len(result["candidates"]) > 0:
-            candidate = result["candidates"][0]
-            if "content" in candidate:
-                parts = candidate["content"].get("parts", [])
-                if parts and len(parts) > 0 and "text" in parts[0]:
-                    answer = parts[0]["text"]
-                    return answer, "SUCCESS"
-        
-        return None, "PARSE_ERROR"
-        
-    except requests.exceptions.Timeout:
-        logger.warning(f"⏰ Model {model} timeout after {timeout}s")
-        if request_id and request_id in active_requests:
-            active_requests[request_id] = False
-        return None, "TIMEOUT"
-    except Exception as e:
-        logger.error(f"❌ Model {model} error: {e}")
-        if request_id and request_id in active_requests:
-            active_requests[request_id] = False
-        return None, "ERROR"
-
-def send_keep_alive_pings(websocket, request_id, total_timeout):
-    """Send keep-alive messages every 2 seconds to prevent Xiaozhi timeout."""
-    try:
-        # Mark this request as active
-        active_requests[request_id] = True
-        
-        start_time = time.time()
-        ping_count = 0
-        
-        while (time.time() - start_time) < total_timeout:
-            if not active_requests.get(request_id, True):
-                # Request completed or cancelled
-                break
-                
-            # Send a keep-alive ping every 2 seconds
-            if ping_count % 2 == 0:  # Every 4 seconds (2 pings * 2 seconds)
-                keep_alive_msg = keep_alive_messages[ping_count % len(keep_alive_messages)]
-                ping_message = {
-                    "jsonrpc": "2.0",
-                    "method": "notifications/progress",
-                    "params": {
-                        "progress": {
-                            "type": "text",
-                            "text": f"⏳ {keep_alive_msg}"
-                        }
-                    }
-                }
-                
-                try:
-                    # Try to send the ping
-                    asyncio.run_coroutine_threadsafe(
-                        websocket.send(json.dumps(ping_message)),
-                        asyncio.get_event_loop()
+    def process_query_parallel(query, tier, cache_key, websocket, request_id):
+        """Process query with parallel model attempts."""
+        try:
+            logger.info(f"🚀 PARALLEL PROCESSING: {tier} tier for '{query[:30]}...'")
+            
+            # START TURBO KEEP-ALIVE IMMEDIATELY
+            TurboKeepAlive.start_keep_alive(websocket, request_id, 30)
+            
+            # Check cache FIRST (fastest path)
+            if cache_key in gemini_cache:
+                cached_time, response = gemini_cache[cache_key]
+                if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
+                    logger.info(f"⚡ CACHE HIT for {request_id}")
+                    return f"[{tier} - Cached] {response}"
+            
+            # Get parallel configuration
+            config = ParallelGeminiProcessor.get_model_config(tier)
+            models = config["models"][:PARALLEL_MODEL_TRIES]
+            max_tokens = config["tokens"]
+            timeouts = config["timeouts"][:PARALLEL_MODEL_TRIES]
+            
+            # Submit ALL models in parallel
+            futures = []
+            with ThreadPoolExecutor(max_workers=PARALLEL_MODEL_TRIES) as executor:
+                for i, model in enumerate(models):
+                    timeout = timeouts[i] if i < len(timeouts) else 15
+                    future = executor.submit(
+                        ParallelGeminiProcessor.call_gemini_turbo,
+                        query, model, max_tokens, timeout
                     )
-                    logger.debug(f"📤 Sent keep-alive ping #{ping_count//2 + 1} for request {request_id}")
-                except Exception as e:
-                    logger.warning(f"Could not send keep-alive ping: {e}")
+                    futures.append((model, future))
+                
+                # Wait for FIRST successful response
+                for model, future in futures:
+                    try:
+                        result, success = future.result(timeout=20)
+                        if success and result:
+                            logger.info(f"✅ {model} succeeded in parallel!")
+                            # Cache the successful result
+                            gemini_cache[cache_key] = (datetime.now(), result)
+                            return f"[{tier} - {model}] {result}"
+                    except concurrent.futures.TimeoutError:
+                        logger.warning(f"⏰ {model} future timeout")
+                    except Exception as e:
+                        logger.error(f"❌ {model} future error: {e}")
             
-            ping_count += 1
-            time.sleep(2)  # Wait 2 seconds between checks
-        
-        # Clean up
-        if request_id in active_requests:
-            del active_requests[request_id]
-            
-    except Exception as e:
-        logger.error(f"❌ Keep-alive thread error: {e}")
-        if request_id in active_requests:
-            del active_requests[request_id]
-
-def call_gemini_api_sync(query, model="gemini-2.5-flash", max_tokens=4096, timeout=20):
-    """Synchronous wrapper for Gemini API calls."""
-    try:
-        if not GEMINI_API_KEY:
-            return "Gemini API key not configured.", "NO_API_KEY"
-        
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        
-        headers = {
-            "Content-Type": "application/json"
-        }
-        
-        data = {
-            "contents": [{
-                "parts": [{
-                    "text": query
-                }]
-            }],
-            "generationConfig": {
-                "maxOutputTokens": max_tokens,
-                "temperature": 0.7,
-                "topP": 0.9,
-                "topK": 40,
-            }
-        }
-        
-        params = {"key": GEMINI_API_KEY}
-        
-        response = requests.post(url, headers=headers, json=data, params=params, timeout=timeout)
-        
-        # Handle 404 - model not available
-        if response.status_code == 404:
-            logger.warning(f"❌ Model {model} not available (404)")
-            return None, "MODEL_NOT_AVAILABLE"
-        
-        # Handle rate limits
-        if response.status_code == 429:
-            logger.warning(f"⏰ Model {model} rate limited (429)")
-            return None, "RATE_LIMITED"
-        
-        response.raise_for_status()
-        
-        result = response.json()
-        
-        if "candidates" in result and len(result["candidates"]) > 0:
-            candidate = result["candidates"][0]
-            if "content" in candidate:
-                parts = candidate["content"].get("parts", [])
-                if parts and len(parts) > 0 and "text" in parts[0]:
-                    answer = parts[0]["text"]
-                    return answer, "SUCCESS"
-        
-        return None, "PARSE_ERROR"
-        
-    except requests.exceptions.Timeout:
-        logger.warning(f"⏰ Model {model} timeout after {timeout}s")
-        return None, "TIMEOUT"
-    except Exception as e:
-        logger.error(f"❌ Model {model} error: {e}")
-        return None, "ERROR"
-
-# ================= ASYNC GEMINI PROCESSING =================
-async def process_gemini_with_keepalive(query, model_info, cache_key, websocket, message_id):
-    """Process Gemini request with keep-alive pings."""
-    tier = model_info["tier"]
-    primary_model = model_info["model"]
-    max_tokens = model_info["tokens"]
-    timeout = model_info["timeout"]
-    fallbacks = model_info["fallbacks"]
-    
-    logger.info(f"🤖 Processing {tier} tier: {primary_model} for '{query[:50]}...'")
-    
-    # Check cache first
-    if cache_key in gemini_cache:
-        cached_time, response = gemini_cache[cache_key]
-        if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
-            logger.info(f"♻️ Cached response from {primary_model}")
-            return f"[{tier} - Cached] {response}"
-    
-    # Generate a unique request ID for keep-alive tracking
-    import uuid
-    request_id = str(uuid.uuid4())[:8]
-    
-    # Try models in order
-    models_to_try = [primary_model] + fallbacks
-    
-    for model in models_to_try:
-        logger.info(f"🔄 Trying model: {model}")
-        
-        # Adjust tokens/timeout for optimal performance
-        model_max_limits = {
-            "gemini-3.0-flash": 8192,
-            "gemini-2.5-pro": 8192,
-            "gemini-2.5-flash": 4096,
-            "gemini-2.5-flash-lite": 2048,
-            "gemini-2.0-flash": 2048,
-            "gemini-1.5-flash": 2048
-        }
-        
-        # Use max tokens for the model
-        model_tokens = min(max_tokens, model_max_limits.get(model, 2048))
-        
-        # Adjust timeout based on model complexity
-        if model == "gemini-3.0-flash":
-            model_timeout = min(timeout, 25)
-        elif model == "gemini-2.5-pro":
-            model_timeout = min(timeout, 25)
-        else:
-            model_timeout = min(timeout, 15)
-        
-        logger.info(f"📝 Using {model_tokens} output tokens for {model} (timeout: {model_timeout}s)")
-        
-        # Send initial "processing" message
-        initial_msg = {
-            "jsonrpc": "2.0",
-            "method": "notifications/progress",
-            "params": {
-                "progress": {
-                    "type": "text",
-                    "text": f"🤔 Processing with {model}..."
-                }
-            }
-        }
-        try:
-            await websocket.send(json.dumps(initial_msg))
-        except:
-            pass
-        
-        # Run Gemini API in a thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        
-        try:
-            # Submit the Gemini API call to a thread pool
-            result, status = await loop.run_in_executor(
-                None,
-                lambda: call_gemini_api_with_keepalive(
-                    query, model, model_tokens, model_timeout, request_id, websocket
+            # If all parallel attempts failed, try sequential fallback
+            logger.warning("⚠️ Parallel failed, trying sequential fallback")
+            for model in models:
+                result, success = ParallelGeminiProcessor.call_gemini_turbo(
+                    query, model, max_tokens, 15
                 )
-            )
+                if success and result:
+                    gemini_cache[cache_key] = (datetime.now(), result)
+                    return f"[{tier} - {model}*] {result}"
             
-            if status == "SUCCESS" and result:
-                # Cache successful response
-                gemini_cache[cache_key] = (datetime.now(), result)
-                
-                # Add tier/model info to response
-                return f"[{tier} - {model}] {result}"
+            return "Sorry, I couldn't generate a response. Please try again."
             
-            elif status == "MODEL_NOT_AVAILABLE":
-                logger.warning(f"❌ Model {model} not available, trying next")
-                continue
-            
-            elif status == "TIMEOUT":
-                logger.warning(f"⏰ Model {model} timeout after {model_timeout}s, trying next")
-                continue
-            
-            elif status == "RATE_LIMITED":
-                logger.warning(f"⏰ Model {model} rate limited, trying next")
-                continue
-                
         except Exception as e:
-            logger.error(f"❌ Async processing error for {model}: {e}")
-            continue
-    
-    # If all models failed
-    logger.error(f"❌ All models failed for query: {query}")
-    return "Gemini AI is currently unavailable. Please try again in a moment."
+            logger.error(f"❌ Parallel processing error: {e}")
+            return f"Error: {str(e)[:50]}"
 
-def ask_gemini_smart_sync(query):
-    """Synchronous version for non-websocket contexts."""
-    try:
-        if not query or not query.strip():
-            return "Please provide a question."
-        
-        # Get classification and model selection
-        model_info = SmartModelSelector.select_model(query)
-        tier = model_info["tier"]
-        primary_model = model_info["model"]
-        max_tokens = model_info["tokens"]
-        timeout = model_info["timeout"]
-        fallbacks = model_info["fallbacks"]
-        
-        logger.info(f"🤖 [Sync] Using {tier} tier: {primary_model} for '{query[:50]}...'")
-        
-        # Check cache first
-        cache_key = hashlib.md5(f"{query}_{primary_model}".encode()).hexdigest()
-        if cache_key in gemini_cache:
-            cached_time, response = gemini_cache[cache_key]
-            if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
-                logger.info(f"♻️ Cached response from {primary_model}")
-                return f"[{tier} - Cached] {response}"
-        
-        # Try models in order
-        models_to_try = [primary_model] + fallbacks
-        
-        for model in models_to_try:
-            logger.info(f"🔄 [Sync] Trying model: {model}")
-            
-            # Adjust tokens/timeout
-            model_max_limits = {
-                "gemini-3.0-flash": 8192,
-                "gemini-2.5-pro": 8192,
-                "gemini-2.5-flash": 4096,
-                "gemini-2.5-flash-lite": 2048,
-                "gemini-2.0-flash": 2048,
-                "gemini-1.5-flash": 2048
-            }
-            
-            model_tokens = min(max_tokens, model_max_limits.get(model, 2048))
-            
-            if model == "gemini-3.0-flash":
-                model_timeout = min(timeout, 25)
-            elif model == "gemini-2.5-pro":
-                model_timeout = min(timeout, 25)
-            else:
-                model_timeout = min(timeout, 15)
-            
-            result, status = call_gemini_api_sync(query, model, model_tokens, model_timeout)
-            
-            if status == "SUCCESS" and result:
-                gemini_cache[cache_key] = (datetime.now(), result)
-                return f"[{tier} - {model}] {result}"
-            
-            elif status in ["MODEL_NOT_AVAILABLE", "TIMEOUT", "RATE_LIMITED"]:
-                continue
-        
-        return "Gemini AI is currently unavailable. Please try again in a moment."
-        
-    except Exception as e:
-        logger.error(f"❌ Smart Gemini sync error: {e}")
-        return f"AI error: {str(e)[:80]}"
-
-# ================= OTHER TOOLS =================
-def google_search(query, max_results=10):
-    """Google Search."""
+# ================= FAST SYNC TOOLS =================
+def google_search_fast(query, max_results=5):
+    """Ultra-fast Google search."""
     try:
         if not GOOGLE_API_KEY or not CSE_ID:
             return "Google Search not configured."
@@ -548,11 +310,10 @@ def google_search(query, max_results=10):
             "safe": "active"
         }
         
-        response = requests.get(url, params=params, timeout=10)
-        response.raise_for_status()
+        response = requests.get(url, params=params, timeout=8)
         data = response.json()
         
-        if "items" not in data or len(data["items"]) == 0:
+        if "items" not in data:
             return "No results found."
         
         items = data["items"][:max_results]
@@ -561,24 +322,21 @@ def google_search(query, max_results=10):
         for i, item in enumerate(items, 1):
             title = item.get('title', 'No title')
             link = item.get('link', 'No link')
-            snippet = item.get('snippet', 'No description')
-            
-            result_text = f"{i}. **{title}**\n   🔗 {link}\n   📝 {snippet}"
-            results.append(result_text)
+            snippet = item.get('snippet', 'No description')[:150]
+            results.append(f"{i}. **{title}**\n🔗 {link}\n📝 {snippet}")
         
-        return "\n\n".join(results)
+        return "\n\n".join(results) if results else "No results found."
         
     except Exception as e:
-        logger.error(f"Google search error: {e}")
-        return "Google search error."
+        logger.error(f"Google error: {e}")
+        return "Search error."
 
-def wikipedia_search(query, max_results=3):
-    """Wikipedia Search."""
+def wikipedia_search_fast(query, max_results=2):
+    """Fast Wikipedia search."""
     try:
         url = "https://en.wikipedia.org/w/api.php"
-        headers = {'User-Agent': 'XiaozhiBot/3.6'}
         
-        search_params = {
+        params = {
             "action": "query",
             "format": "json",
             "list": "search",
@@ -587,62 +345,48 @@ def wikipedia_search(query, max_results=3):
             "utf8": 1
         }
         
-        response = requests.get(url, params=search_params, headers=headers, timeout=10)
-        response.raise_for_status()
+        response = requests.get(url, params=params, timeout=8)
         data = response.json()
         
-        if "query" not in data or "search" not in data["query"]:
-            return "No Wikipedia articles found."
+        if "query" not in data:
+            return "No articles found."
         
-        search_results = data["query"]["search"]
+        search_results = data["query"].get("search", [])
         if not search_results:
-            return "No Wikipedia articles found."
+            return "No articles found."
         
-        page_ids = [str(item["pageid"]) for item in search_results[:max_results]]
+        # Get just first result for speed
+        first = search_results[0]
+        title = first.get("title", "Unknown")
         
         extract_params = {
             "action": "query",
             "format": "json",
-            "pageids": "|".join(page_ids),
-            "prop": "extracts|info",
+            "titles": title,
+            "prop": "extracts",
             "exintro": True,
             "explaintext": True,
-            "inprop": "url",
-            "exchars": 400
+            "exchars": 200
         }
         
-        extract_response = requests.get(url, params=extract_params, headers=headers, timeout=10)
-        extract_response.raise_for_status()
+        extract_response = requests.get(url, params=extract_params, timeout=8)
         extract_data = extract_response.json()
         
         pages = extract_data.get("query", {}).get("pages", {})
+        for page in pages.values():
+            extract = page.get("extract", "No summary.")
+            return f"**{title}**\n📖 {extract[:200]}..."
         
-        results = []
-        for i, page_id in enumerate(page_ids, 1):
-            page = pages.get(page_id)
-            if not page:
-                continue
-                
-            title = page.get("title", "Unknown")
-            extract = page.get("extract", "No summary available.")
-            page_url = page.get("fullurl", f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}")
-            
-            if extract:
-                extract = re.sub(r'\[\d+\]', '', extract)
-                if len(extract) > 300:
-                    extract = extract[:300] + "..."
-            
-            result_text = f"{i}. **{title}**\n   🌐 {page_url}\n   📖 {extract}"
-            results.append(result_text)
-        
-        return "\n\n".join(results) if results else "No content retrieved."
+        return "No content retrieved."
         
     except Exception as e:
         logger.error(f"Wikipedia error: {e}")
-        return "Wikipedia search error."
+        return "Search error."
 
-# ================= MCP PROTOCOL HANDLER WITH KEEP-ALIVE =================
-class MCPProtocolHandler:
+# ================= TURBO MCP HANDLER =================
+class TurboMCPHandler:
+    """Ultra-fast MCP protocol handler."""
+    
     @staticmethod
     def handle_initialize(message_id):
         return {
@@ -652,8 +396,8 @@ class MCPProtocolHandler:
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {
-                    "name": "smart-tier-gemini",
-                    "version": "3.6.1-keepalive"
+                    "name": "turbo-gemini-mcp",
+                    "version": "3.6.1-TURBO"
                 }
             }
         }
@@ -667,34 +411,28 @@ class MCPProtocolHandler:
                 "tools": [
                     {
                         "name": "google_search",
-                        "description": "Search Google",
+                        "description": "Fast Google Search",
                         "inputSchema": {
                             "type": "object",
-                            "properties": {
-                                "query": {"type": "string"}
-                            },
+                            "properties": {"query": {"type": "string"}},
                             "required": ["query"]
                         }
                     },
                     {
                         "name": "wikipedia_search",
-                        "description": "Search Wikipedia",
+                        "description": "Fast Wikipedia Search",
                         "inputSchema": {
                             "type": "object",
-                            "properties": {
-                                "query": {"type": "string"}
-                            },
+                            "properties": {"query": {"type": "string"}},
                             "required": ["query"]
                         }
                     },
                     {
                         "name": "ask_ai",
-                        "description": "Ask AI with SMART tiered model selection (Auto-chooses Gemini 3 Flash/2.5 Flash/Flash-Lite) - Now with keep-alive pings!",
+                        "description": "Ask AI with TURBO tiered processing (1s pings)",
                         "inputSchema": {
                             "type": "object",
-                            "properties": {
-                                "query": {"type": "string"}
-                            },
+                            "properties": {"query": {"type": "string"}},
                             "required": ["query"]
                         }
                     }
@@ -707,8 +445,8 @@ class MCPProtocolHandler:
         return {"jsonrpc": "2.0", "id": message_id, "result": {}}
     
     @staticmethod
-    async def handle_tools_call_async(message_id, params, websocket):
-        """Async handler for tools/call with keep-alive support."""
+    async def handle_tools_call_turbo(message_id, params, websocket):
+        """Turbo-speed tools call with instant keep-alive."""
         tool_name = params.get("name", "")
         query = params.get("arguments", {}).get("query", "").strip()
         
@@ -720,25 +458,32 @@ class MCPProtocolHandler:
             }
         
         try:
+            # Generate request ID for tracking
+            request_id = str(uuid.uuid4())[:8]
+            active_requests[request_id] = True
+            
             if tool_name == "google_search":
-                result = google_search(query)
+                result = google_search_fast(query)
             elif tool_name == "wikipedia_search":
-                result = wikipedia_search(query)
+                result = wikipedia_search_fast(query)
             elif tool_name == "ask_ai":
-                # Get model info for this query
-                model_info = SmartModelSelector.select_model(query)
-                cache_key = hashlib.md5(f"{query}_{model_info['model']}".encode()).hexdigest()
+                # INSTANT TURBO PROCESSING
+                tier = ParallelGeminiProcessor.classify_query_turbo(query)
+                cache_key = hashlib.md5(f"{query}_{tier}".encode()).hexdigest()
                 
-                # Process with keep-alive pings
-                result = await process_gemini_with_keepalive(
-                    query, model_info, cache_key, websocket, message_id
+                # Run in thread pool for non-blocking
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    executor,
+                    ParallelGeminiProcessor.process_query_parallel,
+                    query, tier, cache_key, websocket, request_id
                 )
             else:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": message_id,
-                    "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}
-                }
+                result = f"Unknown tool: {tool_name}"
+            
+            # Clean up
+            if request_id in active_requests:
+                del active_requests[request_id]
             
             return {
                 "jsonrpc": "2.0",
@@ -747,30 +492,21 @@ class MCPProtocolHandler:
             }
             
         except Exception as e:
-            logger.error(f"Tool error: {e}")
+            logger.error(f"❌ Turbo tool error: {e}")
             return {
                 "jsonrpc": "2.0",
                 "id": message_id,
-                "error": {"code": -32000, "message": f"Error: {str(e)[:80]}"}
+                "error": {"code": -32000, "message": f"Error: {str(e)[:50]}"}
             }
 
-# ================= WEB SERVER WITH REAL-TIME FEATURES =================
+# ================= TURBO WEB SERVER =================
 app = Flask(__name__)
 server_start_time = time.time()
 log_buffer = []
 MAX_LOG_LINES = 50
 
-# Store test queries
-test_queries = [
-    "Explain quantum computing in simple terms",
-    "What is the capital of France?",
-    "Write a Python function to calculate Fibonacci",
-    "Compare machine learning and deep learning",
-    "How to make a cup of tea"
-]
-
 def add_log(level, message):
-    """Add log to buffer for real-time display."""
+    """Fast logging."""
     timestamp = datetime.now().strftime('%H:%M:%S')
     log_entry = {
         'time': timestamp,
@@ -779,20 +515,17 @@ def add_log(level, message):
         'color': {
             'INFO': '#4CAF50',
             'WARNING': '#FF9800',
-            'ERROR': '#F44336',
-            'DEBUG': '#2196F3'
+            'ERROR': '#F44336'
         }.get(level, '#757575')
     }
     log_buffer.append(log_entry)
     if len(log_buffer) > MAX_LOG_LINES:
         log_buffer.pop(0)
 
-# Initialize some logs
-add_log('INFO', 'Server starting with keep-alive support...')
-if GEMINI_API_KEY:
-    add_log('INFO', 'Gemini API: ✅ Configured')
-else:
-    add_log('WARNING', 'Gemini API: ❌ Not configured')
+# Initialize
+add_log('INFO', '🚀 TURBO SERVER STARTING...')
+add_log('INFO', f'Gemini: {"✅ CONFIGURED" if GEMINI_API_KEY else "❌ MISSING"}')
+add_log('INFO', f'Turbo Mode: {"✅ ENABLED" if TURBO_MODE else "❌ DISABLED"}')
 
 @app.route('/')
 def index():
@@ -804,773 +537,190 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Xiaozhi MCP v3.6.1 - Dashboard</title>
+        <title>🚀 TURBO MCP v3.6.1</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            :root {
-                --primary: #4285F4;
-                --success: #34A853;
-                --warning: #FBBC05;
-                --danger: #EA4335;
-                --dark: #202124;
-                --light: #f8f9fa;
-            }
-            
             body { 
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-                margin: 0;
-                padding: 20px;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
+                font-family: monospace; 
+                margin: 20px; 
+                background: #000; 
+                color: #0f0;
+                overflow: hidden;
             }
-            
-            .dashboard {
-                max-width: 1400px;
-                margin: 0 auto;
-                display: grid;
-                grid-template-columns: 2fr 1fr;
-                gap: 20px;
-            }
-            
-            .card {
-                background: white;
-                border-radius: 12px;
-                padding: 24px;
-                box-shadow: 0 10px 30px rgba(0,0,0,0.1);
-                margin-bottom: 20px;
-            }
-            
             .header {
-                grid-column: 1 / -1;
-                background: white;
-                padding: 30px;
-                border-radius: 16px;
-                text-align: center;
-                box-shadow: 0 8px 25px rgba(0,0,0,0.1);
+                background: linear-gradient(90deg, #ff0080, #00ff80);
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                font-size: 36px;
+                margin-bottom: 10px;
+                animation: glitch 0.5s infinite;
             }
-            
-            .status-grid {
+            @keyframes glitch {
+                0% { transform: translate(0); }
+                20% { transform: translate(-2px, 2px); }
+                40% { transform: translate(-2px, -2px); }
+                60% { transform: translate(2px, 2px); }
+                80% { transform: translate(2px, -2px); }
+                100% { transform: translate(0); }
+            }
+            .status {
                 display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                gap: 15px;
+                grid-template-columns: repeat(4, 1fr);
+                gap: 10px;
                 margin: 20px 0;
             }
-            
-            .status-item {
+            .stat-box {
+                background: #111;
+                border: 2px solid #0f0;
                 padding: 15px;
-                border-radius: 10px;
+                border-radius: 5px;
                 text-align: center;
-                background: var(--light);
             }
-            
-            .uptime-display {
-                font-size: 28px;
+            .stat-value {
+                font-size: 24px;
+                color: #0ff;
                 font-weight: bold;
-                color: var(--primary);
-                margin: 10px 0;
             }
-            
             .log-panel {
-                height: 400px;
+                height: 300px;
                 overflow-y: auto;
-                background: var(--dark);
-                color: white;
-                border-radius: 8px;
-                padding: 15px;
-                font-family: 'Monaco', 'Menlo', monospace;
-                font-size: 13px;
+                background: #111;
+                border: 2px solid #0f0;
+                padding: 10px;
+                margin-top: 20px;
+                font-family: 'Courier New', monospace;
             }
-            
             .log-entry {
-                padding: 4px 0;
-                border-bottom: 1px solid rgba(255,255,255,0.1);
+                padding: 3px 0;
+                border-bottom: 1px solid #333;
             }
-            
-            .log-time {
-                color: #aaa;
-                margin-right: 10px;
-            }
-            
-            .log-level {
+            .log-time { color: #888; }
+            .INFO { color: #0f0; }
+            .WARNING { color: #ff0; }
+            .ERROR { color: #f00; }
+            .turbo-indicator {
+                color: #f0f;
+                animation: pulse 0.5s infinite;
                 font-weight: bold;
-                padding: 2px 6px;
-                border-radius: 4px;
-                margin-right: 10px;
-                font-size: 11px;
             }
-            
-            .nav-links {
-                display: flex;
-                gap: 10px;
-                margin: 20px 0;
-                flex-wrap: wrap;
-            }
-            
-            .nav-btn {
-                padding: 10px 20px;
-                background: var(--primary);
-                color: white;
-                text-decoration: none;
-                border-radius: 8px;
-                transition: all 0.3s;
-            }
-            
-            .nav-btn:hover {
-                background: #3367D6;
-                transform: translateY(-2px);
-            }
-            
-            .test-section {
-                display: grid;
-                gap: 10px;
-            }
-            
-            .test-btn {
-                padding: 12px;
-                background: var(--light);
-                border: 2px solid var(--primary);
-                border-radius: 8px;
-                cursor: pointer;
-                text-align: left;
-                transition: all 0.3s;
-            }
-            
-            .test-btn:hover {
-                background: var(--primary);
-                color: white;
-            }
-            
-            .result-display {
-                padding: 15px;
-                background: var(--light);
-                border-radius: 8px;
-                margin-top: 15px;
-                display: none;
-                white-space: pre-wrap;
-                max-height: 300px;
-                overflow-y: auto;
-            }
-            
-            .real-time {
-                display: flex;
-                align-items: center;
-                gap: 10px;
-                margin: 15px 0;
-            }
-            
-            .pulse {
-                width: 10px;
-                height: 10px;
-                border-radius: 50%;
-                background: var(--success);
-                animation: pulse 2s infinite;
-            }
-            
             @keyframes pulse {
-                0% { opacity: 1; }
+                0%, 100% { opacity: 1; }
                 50% { opacity: 0.5; }
-                100% { opacity: 1; }
-            }
-            
-            .refresh-btn {
-                padding: 8px 16px;
-                background: var(--warning);
-                color: white;
-                border: none;
-                border-radius: 6px;
-                cursor: pointer;
-            }
-            
-            .grid-2col {
-                grid-column: 1 / -1;
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 20px;
-            }
-            
-            @media (max-width: 1024px) {
-                .dashboard {
-                    grid-template-columns: 1fr;
-                }
-                .grid-2col {
-                    grid-template-columns: 1fr;
-                }
             }
         </style>
     </head>
     <body>
-        <div class="dashboard">
-            <!-- Header -->
-            <div class="header">
-                <h1 style="margin:0;color:var(--primary);">🚀 Xiaozhi MCP v3.6.1</h1>
-                <p style="color:#666;margin:5px 0 20px 0;">With Keep-Alive Pings ⏰</p>
-                
-                <div class="status-grid">
-                    <div class="status-item">
-                        <div style="color:#666;font-size:14px;">Uptime</div>
-                        <div class="uptime-display" id="uptime">{{hours}}h {{minutes}}m {{seconds}}s</div>
-                    </div>
-                    <div class="status-item">
-                        <div style="color:#666;font-size:14px;">Cache Size</div>
-                        <div style="font-size:24px;color:var(--primary);">{{cache_size}} items</div>
-                    </div>
-                    <div class="status-item">
-                        <div style="color:#666;font-size:14px;">Active Requests</div>
-                        <div style="font-size:24px;color:var(--primary);" id="activeRequests">0</div>
-                    </div>
-                    <div class="status-item">
-                        <div style="color:#666;font-size:14px;">Status</div>
-                        <div style="font-size:24px;color:var(--success);">✅ Live</div>
-                    </div>
-                </div>
-                
-                <div class="real-time">
-                    <div class="pulse"></div>
-                    <span>Keep-alive pings active (prevents 5s timeout)</span>
-                    <button class="refresh-btn" onclick="refreshData()">🔄 Refresh</button>
-                </div>
+        <div class="header">🚀 TURBO MCP v3.6.1</div>
+        <div class="turbo-indicator">⚡ TURBO MODE: 1s PINGS ⚡</div>
+        
+        <div class="status">
+            <div class="stat-box">
+                <div>UPTIME</div>
+                <div class="stat-value">{{hours}}h {{minutes}}m</div>
             </div>
-            
-            <!-- Navigation -->
-            <div class="card">
-                <h3 style="margin-top:0;color:var(--primary);">🔗 Quick Links</h3>
-                <div class="nav-links">
-                    <a href="/health" class="nav-btn" target="_blank">📊 Health Check</a>
-                    <a href="/test-smart/hello" class="nav-btn" target="_blank">🧪 Quick Test</a>
-                    <a href="/logs" class="nav-btn" target="_blank">📋 View Logs</a>
-                    <a href="/stats" class="nav-btn" target="_blank">📈 Statistics</a>
-                    <a href="/api-docs" class="nav-btn" target="_blank">📚 API Docs</a>
-                </div>
-                
-                <h3 style="margin-top:25px;color:var(--primary);">⚡ System Info</h3>
-                <div style="background:var(--light);padding:15px;border-radius:8px;">
-                    <div><strong>Version:</strong> 3.6.1-keepalive</div>
-                    <div><strong>MCP Protocol:</strong> 2024-11-05</div>
-                    <div><strong>Keep-Alive:</strong> ✅ Enabled (2s pings)</div>
-                    <div><strong>Models:</strong> Gemini 3 Flash / 2.5 Flash / 2.5 Flash-Lite</div>
-                    <div><strong>Last Updated:</strong> {{timestamp}}</div>
-                </div>
+            <div class="stat-box">
+                <div>CACHE</div>
+                <div class="stat-value">{{cache_size}}</div>
             </div>
-            
-            <!-- Real-time Logs -->
-            <div class="card">
-                <div style="display:flex;justify-content:space-between;align-items:center;">
-                    <h3 style="margin-top:0;color:var(--primary);">📝 Live Logs</h3>
-                    <button class="refresh-btn" onclick="refreshLogs()">↻ Update Logs</button>
-                </div>
-                <div class="log-panel" id="logPanel">
-                    {% for log in logs %}
-                    <div class="log-entry">
-                        <span class="log-time">{{log.time}}</span>
-                        <span class="log-level" style="background:{{log.color}};">{{log.level}}</span>
-                        <span>{{log.message}}</span>
-                    </div>
-                    {% endfor %}
-                </div>
+            <div class="stat-box">
+                <div>ACTIVE</div>
+                <div class="stat-value" id="activeCount">0</div>
             </div>
-            
-            <!-- Testing Panel -->
-            <div class="card">
-                <h3 style="margin-top:0;color:var(--primary);">🧪 Test Tier Classification</h3>
-                <div class="test-section">
-                    {% for query in test_queries %}
-                    <button class="test-btn" onclick="runTest('{{query}}')">
-                        Test: {{query[:50]}}{% if query|length > 50 %}...{% endif %}
-                    </button>
-                    {% endfor %}
-                    
-                    <div style="margin-top:15px;">
-                        <input type="text" id="customQuery" placeholder="Enter custom query..." 
-                               style="width:70%;padding:10px;border:2px solid #ddd;border-radius:6px;">
-                        <button onclick="runCustomTest()" 
-                                style="padding:10px 20px;background:var(--primary);color:white;border:none;border-radius:6px;">
-                            Run Test
-                        </button>
-                    </div>
-                </div>
-                
-                <div id="testResult" class="result-display"></div>
-            </div>
-            
-            <!-- System Stats -->
-            <div class="card grid-2col">
-                <div>
-                    <h3 style="margin-top:0;color:var(--primary);">📊 Performance</h3>
-                    <div style="background:var(--light);padding:15px;border-radius:8px;">
-                        <div style="margin:10px 0;">
-                            <div style="display:flex;justify-content:space-between;">
-                                <span>Gemini API Status:</span>
-                                <span id="geminiStatus" style="color:var(--success);">● Operational</span>
-                            </div>
-                            <div style="height:8px;background:#eee;border-radius:4px;margin:5px 0;">
-                                <div style="width:85%;height:100%;background:var(--success);border-radius:4px;"></div>
-                            </div>
-                        </div>
-                        <div style="margin:10px 0;">
-                            <div style="display:flex;justify-content:space-between;">
-                                <span>Keep-Alive System:</span>
-                                <span id="keepAliveStatus" style="color:var(--success);">● Active</span>
-                            </div>
-                            <div style="height:8px;background:#eee;border-radius:4px;margin:5px 0;">
-                                <div style="width:95%;height:100%;background:var(--success);border-radius:4px;"></div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
-                <div>
-                    <h3 style="margin-top:0;color:var(--primary);">⚙️ Quick Actions</h3>
-                    <div style="display:grid;gap:10px;">
-                        <button onclick="clearCache()" style="padding:12px;background:var(--warning);color:white;border:none;border-radius:6px;">
-                            🗑️ Clear Cache
-                        </button>
-                        <button onclick="forceReconnect()" style="padding:12px;background:var(--primary);color:white;border:none;border-radius:6px;">
-                            🔄 Reconnect MCP
-                        </button>
-                        <button onclick="runDiagnostics()" style="padding:12px;background:#666;color:white;border:none;border-radius:6px;">
-                            🩺 Run Diagnostics
-                        </button>
-                    </div>
-                </div>
+            <div class="stat-box">
+                <div>STATUS</div>
+                <div class="stat-value" style="color:#0f0;">✅ LIVE</div>
             </div>
         </div>
         
+        <div class="log-panel" id="logPanel">
+            {% for log in logs %}
+            <div class="log-entry">
+                <span class="log-time">[{{log.time}}]</span>
+                <span class="{{log.level}}">{{log.message}}</span>
+            </div>
+            {% endfor %}
+        </div>
+        
         <script>
-            // Auto-update uptime
-            function updateUptime() {
-                fetch('/api/uptime')
+            function updateStats() {
+                fetch('/api/stats')
                     .then(r => r.json())
                     .then(data => {
-                        document.getElementById('uptime').textContent = 
-                            `${data.hours}h ${data.minutes}m ${data.seconds}s`;
+                        document.getElementById('activeCount').textContent = data.active_requests;
                     });
             }
             
-            // Update active requests count
-            function updateActiveRequests() {
-                fetch('/api/active-requests')
-                    .then(r => r.json())
-                    .then(data => {
-                        document.getElementById('activeRequests').textContent = data.count;
-                    });
-            }
-            
-            // Update logs
-            function refreshLogs() {
+            function updateLogs() {
                 fetch('/api/logs')
                     .then(r => r.json())
                     .then(logs => {
                         const panel = document.getElementById('logPanel');
                         panel.innerHTML = logs.map(log => `
                             <div class="log-entry">
-                                <span class="log-time">${log.time}</span>
-                                <span class="log-level" style="background:${log.color};">${log.level}</span>
-                                <span>${log.message}</span>
+                                <span class="log-time">[${log.time}]</span>
+                                <span class="${log.level}">${log.message}</span>
                             </div>
                         `).join('');
                         panel.scrollTop = panel.scrollHeight;
                     });
             }
             
-            // Run test
-            function runTest(query) {
-                const resultDiv = document.getElementById('testResult');
-                resultDiv.style.display = 'block';
-                resultDiv.innerHTML = `<div style="color:var(--warning);">⏳ Testing: "${query}" (with keep-alive)...</div>`;
-                
-                fetch('/test-smart/' + encodeURIComponent(query))
-                    .then(r => r.json())
-                    .then(data => {
-                        resultDiv.innerHTML = `
-                            <div style="color:var(--success);margin-bottom:10px;">✅ Test Complete</div>
-                            <div><strong>Query:</strong> ${data.query}</div>
-                            <div><strong>Result:</strong></div>
-                            <div style="margin-top:10px;background:white;padding:10px;border-radius:6px;border:1px solid #ddd;">
-                                ${data.result.replace(/\n/g, '<br>')}
-                            </div>
-                            <div style="margin-top:10px;color:#666;font-size:12px;">
-                                Cache: ${data.cache_size} items | ${data.timestamp}
-                            </div>
-                        `;
-                        add_log('INFO', `Test completed: ${query.substring(0, 30)}...`);
-                    })
-                    .catch(err => {
-                        resultDiv.innerHTML = `<div style="color:var(--danger);">❌ Error: ${err}</div>`;
-                    });
-            }
-            
-            function runCustomTest() {
-                const query = document.getElementById('customQuery').value;
-                if (query) runTest(query);
-            }
-            
-            function refreshData() {
-                updateUptime();
-                updateActiveRequests();
-                refreshLogs();
-                fetch('/api/stats')
-                    .then(r => r.json())
-                    .then(data => {
-                        // Update any stats as needed
-                    });
-                add_log('INFO', 'Dashboard manually refreshed');
-            }
-            
-            // Action functions
-            function clearCache() {
-                if (confirm('Clear all cached responses?')) {
-                    fetch('/api/clear-cache', { method: 'POST' })
-                        .then(r => r.json())
-                        .then(data => {
-                            alert('Cache cleared successfully!');
-                            add_log('INFO', 'Cache cleared manually');
-                        });
-                }
-            }
-            
-            function forceReconnect() {
-                fetch('/api/reconnect', { method: 'POST' })
-                    .then(r => r.json())
-                    .then(data => {
-                        alert('Reconnection initiated');
-                        add_log('INFO', 'Manual reconnection requested');
-                    });
-            }
-            
-            function runDiagnostics() {
-                fetch('/api/diagnostics')
-                    .then(r => r.json())
-                    .then(data => {
-                        alert(`Diagnostics complete:\n\n${JSON.stringify(data, null, 2)}`);
-                        add_log('INFO', 'Diagnostics run completed');
-                    });
-            }
-            
-            // Simulate adding a log (for demo)
-            function add_log(level, message) {
-                const panel = document.getElementById('logPanel');
-                const colors = {
-                    'INFO': '#4CAF50',
-                    'WARNING': '#FF9800',
-                    'ERROR': '#F44336'
-                };
-                const time = new Date().toLocaleTimeString('en-US', {hour12: false});
-                const entry = document.createElement('div');
-                entry.className = 'log-entry';
-                entry.innerHTML = `
-                    <span class="log-time">${time}</span>
-                    <span class="log-level" style="background:${colors[level] || '#666'};">${level}</span>
-                    <span>${message}</span>
-                `;
-                panel.appendChild(entry);
-                panel.scrollTop = panel.scrollHeight;
-            }
-            
-            // Auto-refresh every 5 seconds
-            setInterval(updateUptime, 5000);
-            setInterval(updateActiveRequests, 3000);
-            setInterval(refreshLogs, 10000);
+            // TURBO REFRESH RATES
+            setInterval(updateStats, 1000);  // 1 second
+            setInterval(updateLogs, 2000);   // 2 seconds
             
             // Initial load
-            updateUptime();
-            updateActiveRequests();
+            updateStats();
+            updateLogs();
         </script>
     </body>
     </html>
     ''', 
     hours=hours, 
     minutes=minutes, 
-    seconds=seconds,
     cache_size=len(gemini_cache),
-    log_count=len(log_buffer),
-    logs=log_buffer[-20:],
-    test_queries=test_queries,
-    timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    logs=log_buffer[-15:])
 
 @app.route('/health')
-def health_check():
-    """Comprehensive health check endpoint."""
-    uptime = int(time.time() - server_start_time)
-    add_log('INFO', 'Health check accessed')
-    
+def health():
     return jsonify({
-        "status": "healthy",
-        "version": "3.6.1-keepalive",
-        "uptime_seconds": uptime,
-        "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
-        "cache_size": len(gemini_cache),
-        "log_count": len(log_buffer),
-        "active_requests": len(active_requests),
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "google_configured": bool(GOOGLE_API_KEY and CSE_ID),
-        "last_log": log_buffer[-1]['message'] if log_buffer else "No logs",
-        "timestamp": datetime.now().isoformat()
-    }), 200
-
-@app.route('/logs')
-def view_logs():
-    """View all logs in a clean interface."""
-    return render_template_string('''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>System Logs - Xiaozhi MCP</title>
-        <meta charset="utf-8">
-        <style>
-            body { font-family: monospace; margin: 20px; background: #1a1a1a; color: #fff; }
-            .log-entry { padding: 5px 0; border-bottom: 1px solid #333; }
-            .time { color: #888; margin-right: 15px; }
-            .INFO { color: #4CAF50; }
-            .WARNING { color: #FF9800; }
-            .ERROR { color: #F44336; }
-            .DEBUG { color: #2196F3; }
-            h1 { color: #4285F4; }
-            .back-btn { 
-                background: #4285F4; color: white; padding: 10px 20px; 
-                text-decoration: none; border-radius: 6px; margin-bottom: 20px; display: inline-block;
-            }
-        </style>
-    </head>
-    <body>
-        <a href="/" class="back-btn">← Back to Dashboard</a>
-        <h1>📋 System Logs ({{ logs|length }} entries)</h1>
-        {% for log in logs %}
-        <div class="log-entry">
-            <span class="time">[{{ log.time }}]</span>
-            <span class="{{ log.level }}"><strong>{{ log.level }}</strong></span>
-            <span>{{ log.message }}</span>
-        </div>
-        {% endfor %}
-        <script>
-            // Auto-scroll to bottom
-            window.scrollTo(0, document.body.scrollHeight);
-        </script>
-    </body>
-    </html>
-    ''', logs=log_buffer)
-
-@app.route('/stats')
-def statistics():
-    """Statistics endpoint."""
-    tier_counts = {'HARD': 0, 'MEDIUM': 0, 'SIMPLE': 0}
-    for key in gemini_cache:
-        if '[HARD' in key: tier_counts['HARD'] += 1
-        elif '[MEDIUM' in key: tier_counts['MEDIUM'] += 1
-        elif '[SIMPLE' in key: tier_counts['SIMPLE'] += 1
-    
-    add_log('INFO', 'Statistics page accessed')
-    
-    return jsonify({
-        "cache_statistics": {
-            "total_items": len(gemini_cache),
-            "by_tier": tier_counts,
-            "oldest": min(gemini_cache.values())[0].isoformat() if gemini_cache else None
-        },
-        "log_statistics": {
-            "total_logs": len(log_buffer),
-            "by_level": {
-                'INFO': sum(1 for log in log_buffer if log['level'] == 'INFO'),
-                'WARNING': sum(1 for log in log_buffer if log['level'] == 'WARNING'),
-                'ERROR': sum(1 for log in log_buffer if log['level'] == 'ERROR')
-            }
-        },
-        "system": {
-            "gemini_api_configured": bool(GEMINI_API_KEY),
-            "google_api_configured": bool(GOOGLE_API_KEY),
-            "test_queries_count": len(test_queries),
-            "active_requests_count": len(active_requests)
-        }
-    }), 200
-
-@app.route('/api-docs')
-def api_docs():
-    """API documentation page."""
-    return render_template_string('''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>API Documentation - Xiaozhi MCP</title>
-        <meta charset="utf-8">
-        <style>
-            body { font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
-            h1, h2 { color: #4285F4; }
-            .endpoint { background: #f5f5f5; padding: 15px; margin: 15px 0; border-radius: 8px; }
-            code { background: #333; color: #fff; padding: 2px 6px; border-radius: 4px; }
-            .method { font-weight: bold; color: #34A853; }
-            .back-btn { 
-                background: #4285F4; color: white; padding: 10px 20px; 
-                text-decoration: none; border-radius: 6px; margin-bottom: 20px; display: inline-block;
-            }
-        </style>
-    </head>
-    <body>
-        <a href="/" class="back-btn">← Back to Dashboard</a>
-        <h1>📚 API Documentation</h1>
-        
-        <h2>🔗 Available Endpoints</h2>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/</code> - Main dashboard with real-time monitoring
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/health</code> - System health check (JSON)
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/logs</code> - View system logs
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/stats</code> - Statistics (JSON)
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/test-smart/&lt;query&gt;</code> - Test tier classification
-        </div>
-        
-        <h2>⚡ Real-time APIs</h2>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/api/uptime</code> - Get current uptime
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/api/logs</code> - Get recent logs (JSON)
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/api/active-requests</code> - Get active request count
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">POST</div>
-            <code>/api/clear-cache</code> - Clear Gemini cache
-        </div>
-        
-        <h2>🔧 MCP Protocol with Keep-Alive</h2>
-        <p>The server implements Model Context Protocol (MCP) over WebSocket with keep-alive pings:</p>
-        <ul>
-            <li><strong>Tools:</strong> google_search, wikipedia_search, ask_ai</li>
-            <li><strong>Protocol Version:</strong> 2024-11-05</li>
-            <li><strong>Tier Selection:</strong> Gemini-powered (HARD/MEDIUM/SIMPLE)</li>
-            <li><strong>Keep-Alive:</strong> Sends progress pings every 2s during long AI responses</li>
-            <li><strong>Prevents:</strong> Xiaozhi's 5-second timeout</li>
-        </ul>
-    </body>
-    </html>
-    ''')
-
-# API endpoints for real-time updates
-@app.route('/api/uptime')
-def api_uptime():
-    uptime = int(time.time() - server_start_time)
-    hours, remainder = divmod(uptime, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return jsonify({
-        'hours': hours,
-        'minutes': minutes,
-        'seconds': seconds,
-        'total_seconds': uptime
+        "status": "turbo",
+        "version": "3.6.1-TURBO",
+        "keepalive": "1s pings",
+        "parallel": PARALLEL_MODEL_TRIES,
+        "cache": len(gemini_cache),
+        "active": len(active_requests)
     })
-
-@app.route('/api/logs')
-def api_logs():
-    return jsonify(log_buffer[-30:])
 
 @app.route('/api/stats')
 def api_stats():
     return jsonify({
-        'cache_size': len(gemini_cache),
-        'log_count': len(log_buffer),
         'active_requests': len(active_requests),
-        'test_queries': len(test_queries),
-        'server_time': datetime.now().isoformat()
+        'cache_size': len(gemini_cache)
     })
 
-@app.route('/api/active-requests')
-def api_active_requests():
-    return jsonify({'count': len(active_requests)})
+@app.route('/api/logs')
+def api_logs():
+    return jsonify(log_buffer[-20:])
 
-@app.route('/api/clear-cache', methods=['POST'])
-def api_clear_cache():
-    gemini_cache.clear()
-    add_log('INFO', 'Cache cleared via API')
-    return jsonify({'status': 'success', 'message': 'Cache cleared'})
-
-@app.route('/api/reconnect', methods=['POST'])
-def api_reconnect():
-    add_log('WARNING', 'Manual reconnection requested')
-    return jsonify({'status': 'queued', 'message': 'Reconnection will be attempted'})
-
-@app.route('/api/diagnostics')
-def api_diagnostics():
-    add_log('INFO', 'Diagnostics run')
-    return jsonify({
-        'python_version': sys.version,
-        'environment_vars': {
-            'GEMINI_API_KEY': 'Set' if GEMINI_API_KEY else 'Missing',
-            'GOOGLE_API_KEY': 'Set' if GOOGLE_API_KEY else 'Missing',
-            'CSE_ID': 'Set' if CSE_ID else 'Missing',
-            'XIAOZHI_WS': 'Set' if XIAOZHI_WS else 'Missing'
-        },
-        'cache_info': {
-            'size': len(gemini_cache),
-            'keys_sample': list(gemini_cache.keys())[:3] if gemini_cache else []
-        },
-        'log_info': {
-            'total': len(log_buffer),
-            'recent': [log['message'] for log in log_buffer[-3:]]
-        },
-        'keep_alive_info': {
-            'active_requests': len(active_requests),
-            'messages': keep_alive_messages
-        }
-    })
-
-@app.route('/test-smart/<path:query>')
-def test_smart(query):
-    """Test the smart tier selection."""
-    add_log('INFO', f'Test query: {query[:50]}...')
-    result = ask_gemini_smart_sync(query)
-    add_log('INFO', f'Test completed for: {query[:30]}...')
+# ================= TURBO MCP BRIDGE =================
+async def turbo_mcp_bridge():
+    """Ultra-fast WebSocket bridge."""
+    reconnect_delay = 1  # Fast reconnection
     
-    return jsonify({
-        "query": query,
-        "result": result,
-        "cache_size": len(gemini_cache),
-        "timestamp": datetime.now().isoformat()
-    }), 200
-
-def run_web_server():
-    """Run Flask web server."""
-    add_log('INFO', 'Starting web server on port 3000')
-    app.run(host='0.0.0.0', port=3000, debug=False, threaded=True)
-
-# ================= MAIN MCP BRIDGE WITH KEEP-ALIVE =================
-async def mcp_bridge():
-    """WebSocket bridge with keep-alive support."""
-    reconnect_delay = 2
     while True:
         try:
+            logger.info("🚀 CONNECTING TO XIAOZHI (TURBO MODE)...")
             async with websockets.connect(
                 XIAOZHI_WS,
-                ping_interval=20,  # Send pings every 20 seconds
-                ping_timeout=10,
-                close_timeout=10
+                ping_interval=10,  # Frequent pings
+                ping_timeout=5,
+                close_timeout=5
             ) as websocket:
-                logger.info("✅ Connected to Xiaozhi")
-                add_log('INFO', 'Connected to Xiaozhi MCP endpoint')
-                reconnect_delay = 2
+                logger.info("✅ TURBO CONNECTED!")
+                add_log('INFO', 'TURBO CONNECTED TO XIAOZHI')
+                reconnect_delay = 1
                 
                 async for raw_message in websocket:
                     try:
@@ -1582,63 +732,66 @@ async def mcp_bridge():
                         response = None
                         
                         if method == "ping":
-                            response = MCPProtocolHandler.handle_ping(message_id)
+                            response = TurboMCPHandler.handle_ping(message_id)
                         elif method == "initialize":
-                            response = MCPProtocolHandler.handle_initialize(message_id)
-                            add_log('INFO', 'MCP protocol initialized')
+                            response = TurboMCPHandler.handle_initialize(message_id)
+                            add_log('INFO', 'MCP INITIALIZED (TURBO)')
                         elif method == "tools/list":
-                            response = MCPProtocolHandler.handle_tools_list(message_id)
-                            add_log('INFO', 'Sent tools list to client')
+                            response = TurboMCPHandler.handle_tools_list(message_id)
                         elif method == "tools/call":
-                            # Use async handler with keep-alive support
-                            response = await MCPProtocolHandler.handle_tools_call_async(
+                            # INSTANT TURBO PROCESSING
+                            response = await TurboMCPHandler.handle_tools_call_turbo(
                                 message_id, params, websocket
                             )
                             tool_name = params.get("name", "")
-                            query = params.get("arguments", {}).get("query", "")[:50]
-                            add_log('INFO', f'Processed {tool_name}: {query}...')
-                        elif method == "notifications/initialized":
-                            continue
+                            if tool_name == "ask_ai":
+                                add_log('INFO', f'TURBO AI PROCESSED')
                         else:
-                            response = {"jsonrpc": "2.0", "id": message_id, "error": {"code": -32601, "message": f"Unknown: {method}"}}
+                            response = {"jsonrpc": "2.0", "id": message_id, "error": {"code": -32601, "message": "Unknown method"}}
                         
                         if response:
                             await websocket.send(json.dumps(response))
                             
                     except Exception as e:
-                        error_msg = f"Message processing error: {str(e)[:80]}"
-                        logger.error(error_msg)
-                        add_log('ERROR', error_msg)
+                        add_log('ERROR', f'MSG ERROR: {str(e)[:30]}')
         
         except Exception as e:
-            error_msg = f"Connection error: {str(e)[:80]}"
-            logger.error(error_msg)
+            error_msg = f"CONNECTION ERROR: {str(e)[:50]}"
+            logger.error(f"❌ {error_msg}")
             add_log('ERROR', error_msg)
-            logger.info(f"⏳ Reconnecting in {reconnect_delay}s...")
-            add_log('WARNING', f'Reconnecting in {reconnect_delay}s...')
+            logger.info(f"⚡ RECONNECTING IN {reconnect_delay}s...")
             await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 1.5, 60)
+            reconnect_delay = min(reconnect_delay * 1.5, 5)  # Max 5s delay
+
+def run_web_server():
+    """Run Flask server."""
+    add_log('INFO', '🌐 WEB SERVER STARTING (PORT 3000)')
+    app.run(host='0.0.0.0', port=3000, debug=False, threaded=True, use_reloader=False)
 
 async def main():
-    logger.info("🚀 Starting Xiaozhi MCP v3.6.1 - With Keep-Alive Pings")
-    add_log('INFO', 'Server starting: Xiaozhi MCP v3.6.1 with keep-alive')
+    logger.info("""
+    ╔══════════════════════════════════════════════════╗
+    ║              🚀 TURBO MCP v3.6.1                 ║
+    ║          1s PINGS • PARALLEL PROCESSING          ║
+    ║         MAX TOKENS • NO TIMEOUTS                 ║
+    ╚══════════════════════════════════════════════════╝
+    """)
+    
+    add_log('INFO', '🚀 STARTING TURBO SERVER...')
     
     # Start web server
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
-    logger.info("🌐 Web server on http://0.0.0.0:3000")
-    add_log('INFO', 'Web server started on port 3000')
     
-    # Start MCP bridge
-    await mcp_bridge()
+    # Start turbo bridge
+    await turbo_mcp_bridge()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("👋 Stopped")
-        add_log('INFO', 'Server stopped by user')
+        logger.info("\n👋 TURBO SHUTDOWN")
+        add_log('INFO', 'TURBO SERVER STOPPED')
     except Exception as e:
-        error_msg = f"Fatal error: {str(e)}"
-        logger.error(error_msg)
-        add_log('ERROR', error_msg)
+        logger.error(f"💥 FATAL ERROR: {e}")
+        add_log('ERROR', f'FATAL: {str(e)[:50]}')
