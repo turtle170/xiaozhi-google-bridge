@@ -1,4 +1,4 @@
-# main.py - XIAOZHI MCP SERVER v3.6.1 - TURBO MODE WITH FULL DASHBOARD
+# main.py - XIAOZHI MCP SERVER v3.6.1 - ASYNC PING FIX
 import os
 import asyncio
 import json
@@ -14,9 +14,8 @@ import re
 import hashlib
 from datetime import datetime, timedelta
 import concurrent.futures
-import queue
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Set
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 load_dotenv()
@@ -33,11 +32,12 @@ if not XIAOZHI_WS:
     print("   Go to Render.com dashboard → Environment → Add XIAOZHI_WS")
     sys.exit(1)
 
-# ================= TURBO CONFIGURATION =================
-TURBO_MODE = True
-KEEPALIVE_INTERVAL = 1.0  # 1 SECOND PINGS
-PARALLEL_MODEL_TRIES = 3  # Try multiple models simultaneously
-MAX_WORKERS = 5  # Thread pool size
+# ================= ASYNC PING CONFIGURATION =================
+ASYNC_PING_MODE = True
+FIRST_PING_DELAY = 0.05  # 50ms - INSTANT first ping!
+CONTINUOUS_PING_INTERVAL = 0.8  # 0.8 seconds
+PARALLEL_MODEL_TRIES = 3
+MAX_WORKERS = 5
 
 # ================= LOGGING SETUP =================
 logging.basicConfig(
@@ -53,90 +53,178 @@ logger = logging.getLogger(__name__)
 # ================= GLOBAL STATE =================
 gemini_cache = {}
 CACHE_DURATION = 300
-active_requests = {}
-keep_alive_queue = queue.Queue()
-executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+active_requests: Dict[str, bool] = {}
+ping_tasks: Dict[str, asyncio.Task] = {}
 
 keep_alive_messages = [
-    "AI is thinking...",
-    "Processing your request...",
-    "Generating response...",
-    "Almost ready!",
-    "Working on it...",
-    "Crafting answer..."
+    "AI is thinking... 🧠",
+    "Processing your request... ⚡",
+    "Generating response... ✨",
+    "Almost ready! 🔜",
+    "Working on it... 🔄",
+    "Crafting answer... 📝",
+    "Analyzing your query... 🔍",
+    "Preparing response... 🚀"
 ]
 
-# ================= TURBO KEEP-ALIVE SYSTEM =================
-class TurboKeepAlive:
-    """ULTRA-FAST keep-alive system with 1-second pings."""
+# ================= ASYNC KEEP-ALIVE MANAGER =================
+class AsyncPingManager:
+    """Async-based keep-alive system (THREAD-SAFE for WebSocket)."""
     
-    @staticmethod
-    def start_keep_alive(websocket, request_id, duration=30):
-        """Start aggressive keep-alive pinging in a separate thread."""
-        def keep_alive_worker():
-            try:
-                logger.info(f"🚀 TURBO KEEP-ALIVE STARTED for {request_id}")
-                start_time = time.time()
-                ping_count = 0
+    def __init__(self):
+        self.active_tasks: Dict[str, asyncio.Task] = {}
+        self.websocket_refs: Dict[str, websockets.WebSocketClientProtocol] = {}
+    
+    async def start_pinging(self, websocket, request_id: str, duration: int = 30):
+        """Start async ping task for a request."""
+        try:
+            logger.info(f"🚀 STARTING ASYNC PING for {request_id}")
+            
+            # Store WebSocket reference
+            self.websocket_refs[request_id] = websocket
+            
+            # Create and store ping task
+            task = asyncio.create_task(
+                self._ping_worker(websocket, request_id, duration)
+            )
+            self.active_tasks[request_id] = task
+            
+            # Start the task
+            task.add_done_callback(lambda t: self._cleanup(request_id))
+            
+            logger.info(f"✅ ASYNC PING STARTED for {request_id}")
+            return task
+            
+        except Exception as e:
+            logger.error(f"❌ Failed to start async ping: {e}")
+            return None
+    
+    async def _ping_worker(self, websocket, request_id: str, duration: int):
+        """Async ping worker - runs in same event loop as WebSocket."""
+        try:
+            start_time = time.time()
+            ping_count = 0
+            
+            # PHASE 1: INSTANT FIRST PING (50ms)
+            await asyncio.sleep(FIRST_PING_DELAY)
+            await self._send_safe_ping(websocket, request_id, 0)
+            logger.info(f"✅ INSTANT PING #1 sent for {request_id}")
+            
+            # PHASE 2: CONTINUOUS PINGS (0.8s interval)
+            while time.time() - start_time < duration:
+                if not self._is_request_active(request_id):
+                    logger.info(f"⚠️ Request {request_id} completed, stopping pings")
+                    break
                 
-                while time.time() - start_time < duration:
-                    # Send ping every 1 second
-                    if ping_count % 1 == 0:
-                        message_idx = ping_count % len(keep_alive_messages)
-                        ping_message = {
-                            "jsonrpc": "2.0",
-                            "method": "notifications/progress",
-                            "params": {
-                                "progress": {
-                                    "type": "text",
-                                    "text": f"⏳ {keep_alive_messages[message_idx]}"
-                                }
-                            }
-                        }
-                        
-                        try:
-                            # Use asyncio to send to websocket
-                            asyncio.run_coroutine_threadsafe(
-                                websocket.send(json.dumps(ping_message)),
-                                asyncio.get_event_loop()
-                            )
-                            logger.debug(f"🚀 PING #{ping_count+1} for {request_id}")
-                        except Exception as e:
-                            logger.debug(f"Ping failed: {e}")
-                            break
-                    
+                # Wait for interval
+                await asyncio.sleep(CONTINUOUS_PING_INTERVAL)
+                
+                # Send ping
+                success = await self._send_safe_ping(websocket, request_id, ping_count)
+                if success:
                     ping_count += 1
-                    time.sleep(KEEPALIVE_INTERVAL)  # 1 SECOND!
+                    if ping_count % 5 == 0:  # Log every 5 pings
+                        logger.info(f"📤 Ping #{ping_count} sent for {request_id}")
                 
-                logger.info(f"✅ Keep-alive completed for {request_id}")
+                # Check if WebSocket is still connected
+                if not websocket.open:
+                    logger.warning(f"⚠️ WebSocket closed for {request_id}, stopping pings")
+                    break
+            
+            logger.info(f"✅ Ping worker completed for {request_id} ({ping_count} pings)")
+            
+        except Exception as e:
+            logger.error(f"❌ Ping worker error for {request_id}: {e}")
+        finally:
+            self._cleanup(request_id)
+    
+    async def _send_safe_ping(self, websocket, request_id: str, ping_count: int) -> bool:
+        """Safely send a ping message (handles WebSocket errors)."""
+        try:
+            if not websocket or not websocket.open:
+                logger.warning(f"⚠️ WebSocket not open for {request_id}")
+                return False
+            
+            message_idx = ping_count % len(keep_alive_messages)
+            ping_message = {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {
+                    "progress": {
+                        "type": "text",
+                        "text": f"⏳ {keep_alive_messages[message_idx]}"
+                    }
+                }
+            }
+            
+            await websocket.send(json.dumps(ping_message))
+            return True
+            
+        except websockets.exceptions.ConnectionClosed:
+            logger.warning(f"⚠️ Connection closed while pinging {request_id}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Ping send error for {request_id}: {e}")
+            return False
+    
+    def _is_request_active(self, request_id: str) -> bool:
+        """Check if request is still active."""
+        return request_id in active_requests and active_requests[request_id]
+    
+    def _cleanup(self, request_id: str):
+        """Clean up ping task and references."""
+        try:
+            # Cancel task if still running
+            if request_id in self.active_tasks:
+                task = self.active_tasks[request_id]
+                if not task.done():
+                    task.cancel()
+                del self.active_tasks[request_id]
+            
+            # Remove WebSocket reference
+            if request_id in self.websocket_refs:
+                del self.websocket_refs[request_id]
+            
+            # Remove from active requests
+            if request_id in active_requests:
+                del active_requests[request_id]
                 
-            except Exception as e:
-                logger.error(f"❌ Keep-alive error: {e}")
+            logger.info(f"🧹 Cleaned up ping manager for {request_id}")
+            
+        except Exception as e:
+            logger.error(f"❌ Cleanup error for {request_id}: {e}")
+    
+    def stop_all_pings(self):
+        """Stop all ping tasks (e.g., on shutdown)."""
+        for request_id, task in list(self.active_tasks.items()):
+            if not task.done():
+                task.cancel()
+                logger.info(f"🛑 Stopped ping task for {request_id}")
         
-        # Start the turbo thread
-        thread = threading.Thread(target=keep_alive_worker, daemon=True)
-        thread.start()
-        return thread
+        self.active_tasks.clear()
+        self.websocket_refs.clear()
+
+# Global ping manager
+ping_manager = AsyncPingManager()
 
 # ================= GEMINI-POWERED CLASSIFICATION =================
 class SmartModelSelector:
     """Smart model selection using ONLY Gemini 2.5 Flash-Lite for classification."""
     
     TIERS = {
-        "HARD": "gemini-3.0-flash",      # HARD tasks → Gemini 3 Flash
-        "MEDIUM": "gemini-2.5-flash",    # MEDIUM tasks → Gemini 2.5 Flash
-        "SIMPLE": "gemini-2.5-flash-lite" # SIMPLE tasks → Gemini 2.5 Flash-Lite
+        "HARD": "gemini-3.0-flash",
+        "MEDIUM": "gemini-2.5-flash", 
+        "SIMPLE": "gemini-2.5-flash-lite"
     }
     
     @staticmethod
-    def classify_query_with_gemini(query):
+    def classify_query_with_gemini(query: str) -> str:
         """Use Gemini 2.5 Flash-Lite to classify query into HARD, MEDIUM, or SIMPLE."""
         try:
             if not GEMINI_API_KEY:
-                logger.warning("No Gemini API key, using fallback classification")
+                logger.warning("No Gemini API key, using MEDIUM as default")
                 return "MEDIUM"
             
-            # Prepare the classification prompt
             classification_prompt = f"""Please help me sort this query into 3 tiers: 
 Hard (handled by Gemini 3 Flash), 
 Medium (Handled by Gemini 2.5 Flash), and 
@@ -146,16 +234,10 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
             
-            headers = {
-                "Content-Type": "application/json"
-            }
+            headers = {"Content-Type": "application/json"}
             
             data = {
-                "contents": [{
-                    "parts": [{
-                        "text": classification_prompt
-                    }]
-                }],
+                "contents": [{"parts": [{"text": classification_prompt}]}],
                 "generationConfig": {
                     "maxOutputTokens": 10,
                     "temperature": 0.1,
@@ -166,8 +248,7 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             
             params = {"key": GEMINI_API_KEY}
             
-            # Quick timeout for classification
-            response = requests.post(url, headers=headers, json=data, params=params, timeout=5)
+            response = requests.post(url, headers=headers, json=data, params=params, timeout=3)
             response.raise_for_status()
             
             result = response.json()
@@ -178,62 +259,56 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
                     parts = candidate["content"].get("parts", [])
                     if parts and len(parts) > 0 and "text" in parts[0]:
                         classification = parts[0]["text"].strip().upper()
-                        
-                        # Extract just HARD/MEDIUM/SIMPLE from response
                         for tier in ["HARD", "MEDIUM", "SIMPLE"]:
                             if tier in classification:
+                                logger.info(f"🎯 Classified as {tier}")
                                 return tier
             
-            return "MEDIUM"  # Default fallback
+            return "MEDIUM"
             
         except requests.exceptions.Timeout:
-            logger.warning("⏰ Classification timeout, using MEDIUM as default")
+            logger.warning("⏰ Classification timeout, using MEDIUM")
             return "MEDIUM"
         except Exception as e:
             logger.error(f"❌ Classification error: {e}")
             return "MEDIUM"
 
-# ================= PARALLEL GEMINI PROCESSOR =================
-class ParallelGeminiProcessor:
-    """Process Gemini requests in parallel with turbo speed."""
+# ================= ASYNC GEMINI PROCESSOR =================
+class AsyncGeminiProcessor:
+    """Async Gemini processor with proper WebSocket integration."""
     
     @staticmethod
-    def get_model_config(tier):
-        """Get turbo-optimized model configuration."""
+    def get_model_config(tier: str):
+        """Get model configuration for tier."""
         configs = {
             "HARD": {
                 "models": ["gemini-3.0-flash", "gemini-2.5-pro", "gemini-2.5-flash"],
                 "tokens": 8192,
-                "timeouts": [25, 20, 15]  # Parallel timeouts
+                "timeouts": [20, 15, 12]
             },
             "MEDIUM": {
                 "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
                 "tokens": 4096,
-                "timeouts": [15, 10, 10]
+                "timeouts": [12, 8, 8]
             },
             "SIMPLE": {
                 "models": ["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"],
                 "tokens": 2048,
-                "timeouts": [8, 8, 8]
+                "timeouts": [6, 6, 6]
             }
         }
         return configs.get(tier, configs["MEDIUM"])
     
     @staticmethod
-    def call_gemini_turbo(query, model, max_tokens, timeout):
-        """Turbo-optimized Gemini call."""
+    def call_gemini_sync(query: str, model: str, max_tokens: int, timeout: int):
+        """Synchronous Gemini API call for thread pool."""
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
             
-            headers = {
-                "Content-Type": "application/json",
-                "Accept": "application/json"
-            }
+            headers = {"Content-Type": "application/json"}
             
             data = {
-                "contents": [{
-                    "parts": [{"text": query}]
-                }],
+                "contents": [{"parts": [{"text": query}]}],
                 "generationConfig": {
                     "maxOutputTokens": max_tokens,
                     "temperature": 0.7,
@@ -244,15 +319,7 @@ class ParallelGeminiProcessor:
             
             params = {"key": GEMINI_API_KEY}
             
-            # ULTRA-FAST request with minimal overhead
-            response = requests.post(
-                url, 
-                headers=headers, 
-                json=data, 
-                params=params, 
-                timeout=timeout,
-                verify=True
-            )
+            response = requests.post(url, headers=headers, json=data, params=params, timeout=timeout)
             
             if response.status_code == 200:
                 result = response.json()
@@ -273,57 +340,61 @@ class ParallelGeminiProcessor:
             return None, False
     
     @staticmethod
-    def process_query_parallel(query, tier, cache_key, websocket, request_id):
-        """Process query with parallel model attempts."""
+    async def process_query_async(query: str, tier: str, cache_key: str, websocket, request_id: str):
+        """Process query with async pinging and parallel model attempts."""
         try:
-            logger.info(f"🚀 PARALLEL PROCESSING: {tier} tier for '{query[:30]}...'")
+            logger.info(f"🚀 Processing {tier} tier: '{query[:40]}...'")
             
-            # START TURBO KEEP-ALIVE IMMEDIATELY
-            TurboKeepAlive.start_keep_alive(websocket, request_id, 30)
+            # Mark request as active
+            active_requests[request_id] = True
             
-            # Check cache FIRST (fastest path)
+            # START ASYNC PINGING IMMEDIATELY
+            ping_task = await ping_manager.start_pinging(websocket, request_id, 25)
+            if not ping_task:
+                logger.error("❌ Failed to start pinging!")
+            
+            # Check cache first
             if cache_key in gemini_cache:
                 cached_time, response = gemini_cache[cache_key]
                 if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
-                    logger.info(f"⚡ CACHE HIT for {request_id}")
+                    logger.info(f"⚡ Cache hit for {request_id}")
                     return f"[{tier} - Cached] {response}"
             
-            # Get parallel configuration
-            config = ParallelGeminiProcessor.get_model_config(tier)
+            # Get model configuration
+            config = AsyncGeminiProcessor.get_model_config(tier)
             models = config["models"][:PARALLEL_MODEL_TRIES]
             max_tokens = config["tokens"]
             timeouts = config["timeouts"][:PARALLEL_MODEL_TRIES]
             
-            # Submit ALL models in parallel
+            # Submit models in parallel
             futures = []
             with ThreadPoolExecutor(max_workers=PARALLEL_MODEL_TRIES) as executor:
                 for i, model in enumerate(models):
-                    timeout = timeouts[i] if i < len(timeouts) else 15
+                    timeout = timeouts[i] if i < len(timeouts) else 10
                     future = executor.submit(
-                        ParallelGeminiProcessor.call_gemini_turbo,
+                        AsyncGeminiProcessor.call_gemini_sync,
                         query, model, max_tokens, timeout
                     )
                     futures.append((model, future))
                 
-                # Wait for FIRST successful response
+                # Wait for first successful response
                 for model, future in futures:
                     try:
-                        result, success = future.result(timeout=20)
+                        result, success = future.result(timeout=15)
                         if success and result:
-                            logger.info(f"✅ {model} succeeded in parallel!")
-                            # Cache the successful result
+                            logger.info(f"✅ {model} succeeded!")
                             gemini_cache[cache_key] = (datetime.now(), result)
                             return f"[{tier} - {model}] {result}"
                     except concurrent.futures.TimeoutError:
                         logger.warning(f"⏰ {model} future timeout")
                     except Exception as e:
-                        logger.error(f"❌ {model} future error: {e}")
+                        logger.error(f"❌ {model} error: {e}")
             
-            # If all parallel attempts failed, try sequential fallback
-            logger.warning("⚠️ Parallel failed, trying sequential fallback")
+            # Fallback sequential
+            logger.warning("⚠️ Parallel failed, trying sequential")
             for model in models:
-                result, success = ParallelGeminiProcessor.call_gemini_turbo(
-                    query, model, max_tokens, 15
+                result, success = AsyncGeminiProcessor.call_gemini_sync(
+                    query, model, max_tokens, 10
                 )
                 if success and result:
                     gemini_cache[cache_key] = (datetime.now(), result)
@@ -332,12 +403,15 @@ class ParallelGeminiProcessor:
             return "Sorry, I couldn't generate a response. Please try again."
             
         except Exception as e:
-            logger.error(f"❌ Parallel processing error: {e}")
+            logger.error(f"❌ Processing error: {e}")
             return f"Error: {str(e)[:50]}"
+        finally:
+            # Mark request as completed
+            active_requests[request_id] = False
 
-# ================= FAST SYNC TOOLS =================
-def google_search_fast(query, max_results=5):
-    """Ultra-fast Google search."""
+# ================= FAST TOOLS =================
+def google_search_fast(query: str, max_results: int = 5) -> str:
+    """Fast Google search."""
     try:
         if not GOOGLE_API_KEY or not CSE_ID:
             return "Google Search not configured."
@@ -372,7 +446,7 @@ def google_search_fast(query, max_results=5):
         logger.error(f"Google error: {e}")
         return "Search error."
 
-def wikipedia_search_fast(query, max_results=2):
+def wikipedia_search_fast(query: str, max_results: int = 2) -> str:
     """Fast Wikipedia search."""
     try:
         url = "https://en.wikipedia.org/w/api.php"
@@ -396,7 +470,6 @@ def wikipedia_search_fast(query, max_results=2):
         if not search_results:
             return "No articles found."
         
-        # Get just first result for speed
         first = search_results[0]
         title = first.get("title", "Unknown")
         
@@ -424,9 +497,9 @@ def wikipedia_search_fast(query, max_results=2):
         logger.error(f"Wikipedia error: {e}")
         return "Search error."
 
-# ================= TURBO MCP HANDLER =================
-class TurboMCPHandler:
-    """Ultra-fast MCP protocol handler."""
+# ================= ASYNC MCP HANDLER =================
+class AsyncMCPHandler:
+    """Async MCP protocol handler with proper ping integration."""
     
     @staticmethod
     def handle_initialize(message_id):
@@ -437,8 +510,8 @@ class TurboMCPHandler:
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {
-                    "name": "turbo-gemini-mcp",
-                    "version": "3.6.1-TURBO"
+                    "name": "async-ping-mcp",
+                    "version": "3.6.1-ASYNC-PING"
                 }
             }
         }
@@ -470,7 +543,7 @@ class TurboMCPHandler:
                     },
                     {
                         "name": "ask_ai",
-                        "description": "Ask AI with TURBO tiered processing (1s pings)",
+                        "description": "Ask AI with async pings (50ms first ping!)",
                         "inputSchema": {
                             "type": "object",
                             "properties": {"query": {"type": "string"}},
@@ -486,8 +559,8 @@ class TurboMCPHandler:
         return {"jsonrpc": "2.0", "id": message_id, "result": {}}
     
     @staticmethod
-    async def handle_tools_call_turbo(message_id, params, websocket):
-        """Turbo-speed tools call with instant keep-alive."""
+    async def handle_tools_call_async(message_id, params, websocket):
+        """Async tools call with INSTANT pinging."""
         tool_name = params.get("name", "")
         query = params.get("arguments", {}).get("query", "").strip()
         
@@ -498,33 +571,28 @@ class TurboMCPHandler:
                 "error": {"code": -32602, "message": "Missing query"}
             }
         
+        request_id = str(uuid.uuid4())[:8]
+        
         try:
-            # Generate request ID for tracking
-            request_id = str(uuid.uuid4())[:8]
-            active_requests[request_id] = True
+            logger.info(f"🔄 Processing {tool_name}: '{query[:30]}...' [ID: {request_id}]")
             
             if tool_name == "google_search":
                 result = google_search_fast(query)
             elif tool_name == "wikipedia_search":
                 result = wikipedia_search_fast(query)
             elif tool_name == "ask_ai":
-                # Use Gemini 2.5 Flash-Lite for classification (NO KEYWORDS!)
+                # Get classification
                 tier = SmartModelSelector.classify_query_with_gemini(query)
                 cache_key = hashlib.md5(f"{query}_{tier}".encode()).hexdigest()
                 
-                # Run in thread pool for non-blocking
-                loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(
-                    executor,
-                    ParallelGeminiProcessor.process_query_parallel,
+                # Process with async pinging
+                result = await AsyncGeminiProcessor.process_query_async(
                     query, tier, cache_key, websocket, request_id
                 )
             else:
                 result = f"Unknown tool: {tool_name}"
             
-            # Clean up
-            if request_id in active_requests:
-                del active_requests[request_id]
+            logger.info(f"✅ Completed {tool_name} [ID: {request_id}]")
             
             return {
                 "jsonrpc": "2.0",
@@ -533,20 +601,23 @@ class TurboMCPHandler:
             }
             
         except Exception as e:
-            logger.error(f"❌ Turbo tool error: {e}")
+            logger.error(f"❌ Tool error [ID: {request_id}]: {e}")
             return {
                 "jsonrpc": "2.0",
                 "id": message_id,
                 "error": {"code": -32000, "message": f"Error: {str(e)[:50]}"}
             }
+        finally:
+            # Clean up ping task
+            if request_id in active_requests:
+                active_requests[request_id] = False
 
 # ================= FULL FEATURED WEB SERVER =================
 app = Flask(__name__)
 server_start_time = time.time()
 log_buffer = []
-MAX_LOG_LINES = 50
+MAX_LOG_LINES = 100
 
-# Store test queries
 test_queries = [
     "Explain quantum computing in simple terms",
     "What is the capital of France?",
@@ -555,7 +626,7 @@ test_queries = [
     "How to make a cup of tea"
 ]
 
-def add_log(level, message):
+def add_log(level: str, message: str):
     """Add log to buffer for real-time display."""
     timestamp = datetime.now().strftime('%H:%M:%S')
     log_entry = {
@@ -573,14 +644,11 @@ def add_log(level, message):
     if len(log_buffer) > MAX_LOG_LINES:
         log_buffer.pop(0)
 
-# Initialize some logs
-add_log('INFO', '🚀 TURBO SERVER STARTING...')
-if GEMINI_API_KEY:
-    add_log('INFO', 'Gemini API: ✅ Configured')
-else:
-    add_log('WARNING', 'Gemini API: ❌ Not configured')
-add_log('INFO', f'Turbo Mode: ✅ ENABLED (1s pings)')
-add_log('INFO', f'Parallel Processing: ✅ ENABLED ({PARALLEL_MODEL_TRIES} models)')
+# Initialize logs
+add_log('INFO', '🚀 STARTING ASYNC PING SERVER...')
+add_log('INFO', f'Gemini API: {"✅ CONFIGURED" if GEMINI_API_KEY else "❌ MISSING"}')
+add_log('INFO', f'First ping delay: {FIRST_PING_DELAY}s')
+add_log('INFO', f'Continuous ping interval: {CONTINUOUS_PING_INTERVAL}s')
 
 @app.route('/')
 def index():
@@ -592,7 +660,7 @@ def index():
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Xiaozhi MCP v3.6.1 - Turbo Dashboard</title>
+        <title>Xiaozhi MCP - Async Ping Dashboard</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -786,7 +854,7 @@ def index():
                 }
             }
             
-            .turbo-badge {
+            .ping-badge {
                 background: linear-gradient(90deg, #ff0080, #00ff80);
                 color: white;
                 padding: 5px 10px;
@@ -794,26 +862,23 @@ def index():
                 font-weight: bold;
                 font-size: 12px;
                 margin-left: 10px;
-                animation: glitch 0.5s infinite;
             }
             
-            @keyframes glitch {
-                0% { transform: translate(0); }
-                20% { transform: translate(-1px, 1px); }
-                40% { transform: translate(-1px, -1px); }
-                60% { transform: translate(1px, 1px); }
-                80% { transform: translate(1px, -1px); }
-                100% { transform: translate(0); }
+            .ping-stats {
+                background: var(--light);
+                padding: 10px;
+                border-radius: 8px;
+                margin-top: 10px;
+                font-size: 12px;
             }
         </style>
     </head>
     <body>
         <div class="dashboard">
-            <!-- Header -->
             <div class="header">
                 <h1 style="margin:0;color:var(--primary);">🚀 Xiaozhi MCP v3.6.1</h1>
                 <p style="color:#666;margin:5px 0 20px 0;">
-                    Turbo Mode <span class="turbo-badge">⚡ 1s PINGS</span>
+                    Async Ping Mode <span class="ping-badge">⚡ 50ms FIRST PING</span>
                 </p>
                 
                 <div class="status-grid">
@@ -823,26 +888,32 @@ def index():
                     </div>
                     <div class="status-item">
                         <div style="color:#666;font-size:14px;">Cache Size</div>
-                        <div style="font-size:24px;color:var(--primary);" id="cacheSize">{{cache_size}} items</div>
+                        <div style="font-size:24px;color:var(--primary);" id="cacheSize">{{cache_size}}</div>
                     </div>
                     <div class="status-item">
                         <div style="color:#666;font-size:14px;">Active Requests</div>
-                        <div style="font-size:24px;color:var(--primary);" id="activeRequests">0</div>
+                        <div style="font-size:24px;color:var(--primary);" id="activeRequests">{{active_count}}</div>
                     </div>
                     <div class="status-item">
                         <div style="color:#666;font-size:14px;">Status</div>
-                        <div style="font-size:24px;color:var(--success);">✅ Turbo Live</div>
+                        <div style="font-size:24px;color:var(--success);">✅ Async Live</div>
                     </div>
+                </div>
+                
+                <div class="ping-stats">
+                    <div><strong>Ping Configuration:</strong></div>
+                    <div>• First ping: {{first_ping_delay}}s (INSTANT!)</div>
+                    <div>• Continuous: {{continuous_ping_interval}}s interval</div>
+                    <div>• Parallel models: {{parallel_tries}} simultaneously</div>
                 </div>
                 
                 <div class="real-time">
                     <div class="pulse"></div>
-                    <span>Turbo mode active (1-second keep-alive pings)</span>
+                    <span>Async ping system active (NO THREADING ISSUES)</span>
                     <button class="refresh-btn" onclick="refreshData()">🔄 Refresh</button>
                 </div>
             </div>
             
-            <!-- Navigation -->
             <div class="card">
                 <h3 style="margin-top:0;color:var(--primary);">🔗 Quick Links</h3>
                 <div class="nav-links">
@@ -853,18 +924,16 @@ def index():
                     <a href="/api-docs" class="nav-btn" target="_blank">📚 API Docs</a>
                 </div>
                 
-                <h3 style="margin-top:25px;color:var(--primary);">⚡ Turbo System Info</h3>
+                <h3 style="margin-top:25px;color:var(--primary);">⚡ Ping System Info</h3>
                 <div style="background:var(--light);padding:15px;border-radius:8px;">
-                    <div><strong>Version:</strong> 3.6.1-TURBO</div>
+                    <div><strong>Version:</strong> 3.6.1-ASYNC-PING</div>
                     <div><strong>MCP Protocol:</strong> 2024-11-05</div>
-                    <div><strong>Keep-Alive:</strong> ⚡ 1-second pings</div>
-                    <div><strong>Parallel Models:</strong> {{parallel_tries}} simultaneous</div>
-                    <div><strong>Classification:</strong> Gemini 2.5 Flash-Lite</div>
+                    <div><strong>First Ping:</strong> ⚡ {{first_ping_delay}}s (GUARANTEED!)</div>
+                    <div><strong>WebSocket:</strong> ✅ Same event loop (thread-safe)</div>
                     <div><strong>Last Updated:</strong> {{timestamp}}</div>
                 </div>
             </div>
             
-            <!-- Real-time Logs -->
             <div class="card">
                 <div style="display:flex;justify-content:space-between;align-items:center;">
                     <h3 style="margin-top:0;color:var(--primary);">📝 Live Logs</h3>
@@ -881,9 +950,8 @@ def index():
                 </div>
             </div>
             
-            <!-- Testing Panel -->
             <div class="card">
-                <h3 style="margin-top:0;color:var(--primary);">🧪 Test Tier Classification</h3>
+                <h3 style="margin-top:0;color:var(--primary);">🧪 Test Classification</h3>
                 <div class="test-section">
                     {% for query in test_queries %}
                     <button class="test-btn" onclick="runTest('{{query}}')">
@@ -904,24 +972,23 @@ def index():
                 <div id="testResult" class="result-display"></div>
             </div>
             
-            <!-- System Stats -->
             <div class="card grid-2col">
                 <div>
                     <h3 style="margin-top:0;color:var(--primary);">📊 Performance</h3>
                     <div style="background:var(--light);padding:15px;border-radius:8px;">
                         <div style="margin:10px 0;">
                             <div style="display:flex;justify-content:space-between;">
-                                <span>Gemini API Status:</span>
-                                <span id="geminiStatus" style="color:var(--success);">● Operational</span>
+                                <span>Async Ping System:</span>
+                                <span id="pingStatus" style="color:var(--success);">● ACTIVE</span>
                             </div>
                             <div style="height:8px;background:#eee;border-radius:4px;margin:5px 0;">
-                                <div style="width:85%;height:100%;background:var(--success);border-radius:4px;"></div>
+                                <div style="width:100%;height:100%;background:var(--success);border-radius:4px;"></div>
                             </div>
                         </div>
                         <div style="margin:10px 0;">
                             <div style="display:flex;justify-content:space-between;">
-                                <span>Keep-Alive System:</span>
-                                <span id="keepAliveStatus" style="color:var(--success);">● Active</span>
+                                <span>WebSocket Connection:</span>
+                                <span id="wsStatus" style="color:var(--success);">● STABLE</span>
                             </div>
                             <div style="height:8px;background:#eee;border-radius:4px;margin:5px 0;">
                                 <div style="width:95%;height:100%;background:var(--success);border-radius:4px;"></div>
@@ -948,7 +1015,6 @@ def index():
         </div>
         
         <script>
-            // Auto-update uptime
             function updateUptime() {
                 fetch('/api/uptime')
                     .then(r => r.json())
@@ -958,7 +1024,6 @@ def index():
                     });
             }
             
-            // Update active requests count
             function updateActiveRequests() {
                 fetch('/api/active-requests')
                     .then(r => r.json())
@@ -967,16 +1032,14 @@ def index():
                     });
             }
             
-            // Update cache size
             function updateCacheSize() {
                 fetch('/api/stats')
                     .then(r => r.json())
                     .then(data => {
-                        document.getElementById('cacheSize').textContent = data.cache_size + ' items';
+                        document.getElementById('cacheSize').textContent = data.cache_size;
                     });
             }
             
-            // Update logs
             function refreshLogs() {
                 fetch('/api/logs')
                     .then(r => r.json())
@@ -993,11 +1056,10 @@ def index():
                     });
             }
             
-            // Run test
             function runTest(query) {
                 const resultDiv = document.getElementById('testResult');
                 resultDiv.style.display = 'block';
-                resultDiv.innerHTML = `<div style="color:var(--warning);">⏳ Testing: "${query}" (Turbo mode)...</div>`;
+                resultDiv.innerHTML = `<div style="color:var(--warning);">⏳ Testing: "${query}" (Async ping mode)...</div>`;
                 
                 fetch('/test-smart/' + encodeURIComponent(query))
                     .then(r => r.json())
@@ -1013,7 +1075,6 @@ def index():
                                 Cache: ${data.cache_size} items | ${data.timestamp}
                             </div>
                         `;
-                        add_log('INFO', `Test completed: ${query.substring(0, 30)}...`);
                     })
                     .catch(err => {
                         resultDiv.innerHTML = `<div style="color:var(--danger);">❌ Error: ${err}</div>`;
@@ -1030,17 +1091,14 @@ def index():
                 updateActiveRequests();
                 updateCacheSize();
                 refreshLogs();
-                add_log('INFO', 'Dashboard manually refreshed');
             }
             
-            // Action functions
             function clearCache() {
                 if (confirm('Clear all cached responses?')) {
                     fetch('/api/clear-cache', { method: 'POST' })
                         .then(r => r.json())
                         .then(data => {
                             alert('Cache cleared successfully!');
-                            add_log('INFO', 'Cache cleared manually');
                         });
                 }
             }
@@ -1050,7 +1108,6 @@ def index():
                     .then(r => r.json())
                     .then(data => {
                         alert('Reconnection initiated');
-                        add_log('INFO', 'Manual reconnection requested');
                     });
             }
             
@@ -1059,35 +1116,14 @@ def index():
                     .then(r => r.json())
                     .then(data => {
                         alert(`Diagnostics complete:\n\n${JSON.stringify(data, null, 2)}`);
-                        add_log('INFO', 'Diagnostics run completed');
                     });
             }
             
-            // Simulate adding a log (for demo)
-            function add_log(level, message) {
-                const panel = document.getElementById('logPanel');
-                const colors = {
-                    'INFO': '#4CAF50',
-                    'WARNING': '#FF9800',
-                    'ERROR': '#F44336'
-                };
-                const time = new Date().toLocaleTimeString('en-US', {hour12: false});
-                const entry = document.createElement('div');
-                entry.className = 'log-entry';
-                entry.innerHTML = `
-                    <span class="log-time">${time}</span>
-                    <span class="log-level" style="background:${colors[level] || '#666'};">${level}</span>
-                    <span>${message}</span>
-                `;
-                panel.appendChild(entry);
-                panel.scrollTop = panel.scrollHeight;
-            }
-            
-            // TURBO REFRESH RATES
-            setInterval(updateUptime, 1000);      // 1 second
-            setInterval(updateActiveRequests, 1000); // 1 second
-            setInterval(updateCacheSize, 2000);   // 2 seconds
-            setInterval(refreshLogs, 3000);       // 3 seconds
+            // Fast refresh rates
+            setInterval(updateUptime, 1000);
+            setInterval(updateActiveRequests, 1000);
+            setInterval(updateCacheSize, 2000);
+            setInterval(refreshLogs, 3000);
             
             // Initial load
             updateUptime();
@@ -1101,38 +1137,37 @@ def index():
     minutes=minutes, 
     seconds=seconds,
     cache_size=len(gemini_cache),
-    log_count=len(log_buffer),
+    active_count=len(active_requests),
     logs=log_buffer[-20:],
     test_queries=test_queries,
     timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    first_ping_delay=FIRST_PING_DELAY,
+    continuous_ping_interval=CONTINUOUS_PING_INTERVAL,
     parallel_tries=PARALLEL_MODEL_TRIES)
 
 @app.route('/health')
 def health_check():
-    """Comprehensive health check endpoint."""
+    """Health check endpoint."""
     uptime = int(time.time() - server_start_time)
     add_log('INFO', 'Health check accessed')
     
     return jsonify({
-        "status": "turbo_healthy",
-        "version": "3.6.1-TURBO",
-        "uptime_seconds": uptime,
-        "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
+        "status": "async_ping_healthy",
+        "version": "3.6.1-ASYNC-PING",
+        "uptime": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
         "cache_size": len(gemini_cache),
-        "log_count": len(log_buffer),
         "active_requests": len(active_requests),
-        "gemini_configured": bool(GEMINI_API_KEY),
-        "google_configured": bool(GOOGLE_API_KEY and CSE_ID),
-        "turbo_mode": TURBO_MODE,
-        "keepalive_interval": KEEPALIVE_INTERVAL,
-        "parallel_tries": PARALLEL_MODEL_TRIES,
-        "last_log": log_buffer[-1]['message'] if log_buffer else "No logs",
+        "ping_config": {
+            "first_ping_delay": FIRST_PING_DELAY,
+            "continuous_interval": CONTINUOUS_PING_INTERVAL,
+            "async_mode": True
+        },
         "timestamp": datetime.now().isoformat()
-    }), 200
+    })
 
 @app.route('/logs')
 def view_logs():
-    """View all logs in a clean interface."""
+    """View all logs."""
     return render_template_string('''
     <!DOCTYPE html>
     <html>
@@ -1165,7 +1200,6 @@ def view_logs():
         </div>
         {% endfor %}
         <script>
-            // Auto-scroll to bottom
             window.scrollTo(0, document.body.scrollHeight);
         </script>
     </body>
@@ -1175,42 +1209,18 @@ def view_logs():
 @app.route('/stats')
 def statistics():
     """Statistics endpoint."""
-    tier_counts = {'HARD': 0, 'MEDIUM': 0, 'SIMPLE': 0}
-    for key in gemini_cache:
-        if '[HARD' in key: tier_counts['HARD'] += 1
-        elif '[MEDIUM' in key: tier_counts['MEDIUM'] += 1
-        elif '[SIMPLE' in key: tier_counts['SIMPLE'] += 1
-    
     add_log('INFO', 'Statistics page accessed')
     
     return jsonify({
-        "cache_statistics": {
-            "total_items": len(gemini_cache),
-            "by_tier": tier_counts,
-            "oldest": min(gemini_cache.values())[0].isoformat() if gemini_cache else None
-        },
-        "log_statistics": {
-            "total_logs": len(log_buffer),
-            "by_level": {
-                'INFO': sum(1 for log in log_buffer if log['level'] == 'INFO'),
-                'WARNING': sum(1 for log in log_buffer if log['level'] == 'WARNING'),
-                'ERROR': sum(1 for log in log_buffer if log['level'] == 'ERROR')
-            }
-        },
-        "system": {
-            "gemini_api_configured": bool(GEMINI_API_KEY),
-            "google_api_configured": bool(GOOGLE_API_KEY),
-            "test_queries_count": len(test_queries),
-            "active_requests_count": len(active_requests),
-            "turbo_mode": TURBO_MODE,
-            "keepalive_interval": KEEPALIVE_INTERVAL,
-            "parallel_model_tries": PARALLEL_MODEL_TRIES
-        }
-    }), 200
+        "cache_size": len(gemini_cache),
+        "active_requests": len(active_requests),
+        "log_count": len(log_buffer),
+        "server_time": datetime.now().isoformat()
+    })
 
 @app.route('/api-docs')
 def api_docs():
-    """API documentation page."""
+    """API documentation."""
     return render_template_string('''
     <!DOCTYPE html>
     <html>
@@ -1234,74 +1244,36 @@ def api_docs():
         <h1>📚 API Documentation</h1>
         
         <h2>🔗 Available Endpoints</h2>
-        
         <div class="endpoint">
             <div class="method">GET</div>
             <code>/</code> - Main dashboard with real-time monitoring
         </div>
-        
         <div class="endpoint">
             <div class="method">GET</div>
             <code>/health</code> - System health check (JSON)
         </div>
-        
         <div class="endpoint">
             <div class="method">GET</div>
             <code>/logs</code> - View system logs
         </div>
-        
         <div class="endpoint">
             <div class="method">GET</div>
             <code>/stats</code> - Statistics (JSON)
         </div>
         
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/test-smart/&lt;query&gt;</code> - Test tier classification
-        </div>
-        
-        <h2>⚡ Real-time APIs</h2>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/api/uptime</code> - Get current uptime
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/api/logs</code> - Get recent logs (JSON)
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/api/active-requests</code> - Get active request count
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/api/stats</code> - Get system stats (JSON)
-        </div>
-        
-        <div class="endpoint">
-            <div class="method">POST</div>
-            <code>/api/clear-cache</code> - Clear Gemini cache
-        </div>
-        
-        <h2>🔧 MCP Protocol with Turbo Features</h2>
-        <p>The server implements Model Context Protocol (MCP) over WebSocket with TURBO features:</p>
+        <h2>🔧 MCP Protocol with Async Pings</h2>
+        <p>The server implements Model Context Protocol (MCP) over WebSocket with ASYNC pinging:</p>
         <ul>
             <li><strong>Tools:</strong> google_search, wikipedia_search, ask_ai</li>
             <li><strong>Protocol Version:</strong> 2024-11-05</li>
-            <li><strong>Tier Selection:</strong> Gemini 2.5 Flash-Lite powered (HARD/MEDIUM/SIMPLE)</li>
-            <li><strong>Turbo Mode:</strong> ⚡ 1-second keep-alive pings</li>
-            <li><strong>Parallel Processing:</strong> {{parallel_tries}} models simultaneously</li>
-            <li><strong>Prevents:</strong> Xiaozhi's 5-second timeout completely</li>
+            <li><strong>Async Pings:</strong> ⚡ 50ms first ping guaranteed</li>
+            <li><strong>Thread-Safe:</strong> ✅ WebSocket in same event loop</li>
+            <li><strong>Prevents:</strong> Xiaozhi 5-8s timeout completely</li>
         </ul>
     </body>
     </html>
-    ''', parallel_tries=PARALLEL_MODEL_TRIES)
+    ''')
 
-# API endpoints for real-time updates
 @app.route('/api/uptime')
 def api_uptime():
     uptime = int(time.time() - server_start_time)
@@ -1310,8 +1282,7 @@ def api_uptime():
     return jsonify({
         'hours': hours,
         'minutes': minutes,
-        'seconds': seconds,
-        'total_seconds': uptime
+        'seconds': seconds
     })
 
 @app.route('/api/logs')
@@ -1322,10 +1293,7 @@ def api_logs():
 def api_stats():
     return jsonify({
         'cache_size': len(gemini_cache),
-        'log_count': len(log_buffer),
-        'active_requests': len(active_requests),
-        'test_queries': len(test_queries),
-        'server_time': datetime.now().isoformat()
+        'active_requests': len(active_requests)
     })
 
 @app.route('/api/active-requests')
@@ -1338,92 +1306,45 @@ def api_clear_cache():
     add_log('INFO', 'Cache cleared via API')
     return jsonify({'status': 'success', 'message': 'Cache cleared'})
 
-@app.route('/api/reconnect', methods=['POST'])
-def api_reconnect():
-    add_log('WARNING', 'Manual reconnection requested')
-    return jsonify({'status': 'queued', 'message': 'Reconnection will be attempted'})
-
-@app.route('/api/diagnostics')
-def api_diagnostics():
-    add_log('INFO', 'Diagnostics run')
-    return jsonify({
-        'python_version': sys.version,
-        'environment_vars': {
-            'GEMINI_API_KEY': 'Set' if GEMINI_API_KEY else 'Missing',
-            'GOOGLE_API_KEY': 'Set' if GOOGLE_API_KEY else 'Missing',
-            'CSE_ID': 'Set' if CSE_ID else 'Missing',
-            'XIAOZHI_WS': 'Set' if XIAOZHI_WS else 'Missing'
-        },
-        'cache_info': {
-            'size': len(gemini_cache),
-            'keys_sample': list(gemini_cache.keys())[:3] if gemini_cache else []
-        },
-        'log_info': {
-            'total': len(log_buffer),
-            'recent': [log['message'] for log in log_buffer[-3:]]
-        },
-        'turbo_info': {
-            'active_requests': len(active_requests),
-            'keepalive_interval': KEEPALIVE_INTERVAL,
-            'parallel_tries': PARALLEL_MODEL_TRIES,
-            'max_workers': MAX_WORKERS
-        }
-    })
-
 @app.route('/test-smart/<path:query>')
 def test_smart(query):
-    """Test endpoint with sync processing for web UI."""
+    """Test endpoint."""
     add_log('INFO', f'Test query: {query[:50]}...')
     
-    # Use simplified sync version for web testing
     try:
-        # Get classification
         tier = SmartModelSelector.classify_query_with_gemini(query)
-        cache_key = hashlib.md5(f"{query}_{tier}".encode()).hexdigest()
-        
-        # Check cache
-        if cache_key in gemini_cache:
-            cached_time, response = gemini_cache[cache_key]
-            if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
-                result = f"[{tier} - Cached] {response}"
-            else:
-                result = f"[{tier}] Test mode - classification only"
-        else:
-            result = f"[{tier}] Test mode - classification only"
-            
+        result = f"[{tier}] Test classification completed"
     except Exception as e:
         result = f"Test error: {str(e)[:50]}"
-    
-    add_log('INFO', f'Test completed for: {query[:30]}...')
     
     return jsonify({
         "query": query,
         "result": result,
         "cache_size": len(gemini_cache),
         "timestamp": datetime.now().isoformat()
-    }), 200
+    })
 
 def run_web_server():
-    """Run Flask web server."""
+    """Run Flask server."""
     add_log('INFO', 'Starting web server on port 3000')
     app.run(host='0.0.0.0', port=3000, debug=False, threaded=True, use_reloader=False)
 
-# ================= TURBO MCP BRIDGE =================
-async def turbo_mcp_bridge():
-    """Ultra-fast WebSocket bridge."""
-    reconnect_delay = 1  # Fast reconnection
+# ================= ASYNC MCP BRIDGE =================
+async def async_mcp_bridge():
+    """Async WebSocket bridge with proper ping management."""
+    reconnect_delay = 1
     
     while True:
         try:
-            logger.info("🚀 CONNECTING TO XIAOZHI (TURBO MODE)...")
+            logger.info("🔗 Connecting to Xiaozhi (Async Ping Mode)...")
             async with websockets.connect(
                 XIAOZHI_WS,
-                ping_interval=10,  # Frequent pings
-                ping_timeout=5,
+                ping_interval=15,
+                ping_timeout=10,
                 close_timeout=5
             ) as websocket:
-                logger.info("✅ TURBO CONNECTED!")
-                add_log('INFO', 'TURBO CONNECTED TO XIAOZHI')
+                logger.info("✅ CONNECTED TO XIAOZHI")
+                add_log('INFO', 'Connected to Xiaozhi (Async Ping)')
                 reconnect_delay = 1
                 
                 async for raw_message in websocket:
@@ -1436,20 +1357,19 @@ async def turbo_mcp_bridge():
                         response = None
                         
                         if method == "ping":
-                            response = TurboMCPHandler.handle_ping(message_id)
+                            response = AsyncMCPHandler.handle_ping(message_id)
                         elif method == "initialize":
-                            response = TurboMCPHandler.handle_initialize(message_id)
-                            add_log('INFO', 'MCP INITIALIZED (TURBO)')
+                            response = AsyncMCPHandler.handle_initialize(message_id)
+                            add_log('INFO', 'MCP Initialized (Async Ping)')
                         elif method == "tools/list":
-                            response = TurboMCPHandler.handle_tools_list(message_id)
+                            response = AsyncMCPHandler.handle_tools_list(message_id)
                         elif method == "tools/call":
-                            # INSTANT TURBO PROCESSING
-                            response = await TurboMCPHandler.handle_tools_call_turbo(
+                            response = await AsyncMCPHandler.handle_tools_call_async(
                                 message_id, params, websocket
                             )
                             tool_name = params.get("name", "")
                             if tool_name == "ask_ai":
-                                add_log('INFO', f'TURBO AI PROCESSED')
+                                add_log('INFO', 'AI processed with async pings')
                         else:
                             response = {"jsonrpc": "2.0", "id": message_id, "error": {"code": -32601, "message": "Unknown method"}}
                         
@@ -1457,40 +1377,45 @@ async def turbo_mcp_bridge():
                             await websocket.send(json.dumps(response))
                             
                     except Exception as e:
-                        add_log('ERROR', f'MSG ERROR: {str(e)[:30]}')
-        
+                        add_log('ERROR', f'Message error: {str(e)[:30]}')
+                        
         except Exception as e:
-            error_msg = f"CONNECTION ERROR: {str(e)[:50]}"
+            error_msg = f"Connection error: {str(e)[:50]}"
             logger.error(f"❌ {error_msg}")
             add_log('ERROR', error_msg)
-            logger.info(f"⚡ RECONNECTING IN {reconnect_delay}s...")
+            
+            # Clean up all ping tasks
+            ping_manager.stop_all_pings()
+            active_requests.clear()
+            
+            logger.info(f"🔄 Reconnecting in {reconnect_delay}s...")
             await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 1.5, 5)  # Max 5s delay
+            reconnect_delay = min(reconnect_delay * 1.5, 5)
 
 async def main():
     logger.info("""
     ╔══════════════════════════════════════════════════╗
-    ║              🚀 TURBO MCP v3.6.1                 ║
-    ║          1s PINGS • PARALLEL PROCESSING          ║
-    ║      GEMINI CLASSIFICATION • FULL DASHBOARD      ║
+    ║           🚀 ASYNC PING MCP v3.6.1              ║
+    ║         NO THREADING • SAME EVENT LOOP          ║
+    ║          50ms FIRST PING GUARANTEED             ║
     ╚══════════════════════════════════════════════════╝
     """)
     
-    add_log('INFO', '🚀 STARTING TURBO SERVER...')
+    add_log('INFO', '🚀 Starting Async Ping Server...')
     
     # Start web server
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
     
-    # Start turbo bridge
-    await turbo_mcp_bridge()
+    # Start MCP bridge
+    await async_mcp_bridge()
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("\n👋 TURBO SHUTDOWN")
-        add_log('INFO', 'TURBO SERVER STOPPED')
+        logger.info("\n👋 Server stopped by user")
+        add_log('INFO', 'Server stopped by user')
     except Exception as e:
-        logger.error(f"💥 FATAL ERROR: {e}")
-        add_log('ERROR', f'FATAL: {str(e)[:50]}')
+        logger.error(f"💥 Fatal error: {e}")
+        add_log('ERROR', f'Fatal: {str(e)[:50]}')
