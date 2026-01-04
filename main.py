@@ -1,22 +1,18 @@
-# main.py - XIAOZHI MCP SERVER v3.6 - TIERED MODEL SELECTION
-# ONLY MODIFIED: Classification system to use Gemini 2.5 Flash-Lite
-# EVERYTHING ELSE: Kept exactly as you had it
+# main.py - XIAOZHI MCP SERVER v3.6 - GEMINI-POWERED TIER SELECTION
 import os
 import asyncio
 import json
 import websockets
 import requests
 import logging
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template_string
 import threading
 import time
 import sys
 from dotenv import load_dotenv
 import re
-import random
 import hashlib
 from datetime import datetime, timedelta
-import concurrent.futures
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 load_dotenv()
@@ -44,15 +40,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ================= TIERED MODEL SELECTION (UPDATED) =================
+# ================= GEMINI-POWERED TIER SELECTION =================
 class SmartModelSelector:
     """Smart model selection using Gemini 2.5 Flash-Lite for classification."""
     
-    # YOUR EXACT TIERS (unchanged)
+    # Model tiers based on classification
     TIERS = {
-        "HARD": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
-        "MEDIUM": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
-        "SIMPLE": ["gemini-2.5-flash-lite"]
+        "HARD": "gemini-2.5-pro",
+        "MEDIUM": "gemini-2.5-flash", 
+        "SIMPLE": "gemini-2.5-flash-lite"
     }
     
     @staticmethod
@@ -63,8 +59,13 @@ class SmartModelSelector:
                 logger.warning("No Gemini API key, using fallback classification")
                 return "MEDIUM"
             
-            # Use your exact prompt
-            classification_prompt = f"""Please help me sort this query into 3 tiers: Hard (handled by Gemini 2.5 Pro), Medium (Handled by Gemini 2.5 Flash), and Simple (Handled by Gemini 2.5 Flash-Lite): "{query}", and strictly only say "HARD","MEDIUM", OR "SIMPLE", no extra."""
+            # Prepare the classification prompt
+            classification_prompt = f"""Please help me sort this query into 3 tiers: 
+Hard (handled by Gemini 2.5 Pro), 
+Medium (Handled by Gemini 2.5 Flash), and 
+Simple (Handled by Gemini 2.5 Flash-Lite): "{query}"
+
+Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."""
             
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
             
@@ -88,7 +89,8 @@ class SmartModelSelector:
             
             params = {"key": GEMINI_API_KEY}
             
-            response = requests.post(url, headers=headers, json=data, params=params, timeout=3)
+            # Quick timeout for classification
+            response = requests.post(url, headers=headers, json=data, params=params, timeout=5)
             response.raise_for_status()
             
             result = response.json()
@@ -104,9 +106,15 @@ class SmartModelSelector:
                         for tier in ["HARD", "MEDIUM", "SIMPLE"]:
                             if tier in classification:
                                 return tier
+                        
+                        # Fallback if not found
+                        logger.warning(f"Unexpected classification: {classification}")
             
             return "MEDIUM"  # Default fallback
             
+        except requests.exceptions.Timeout:
+            logger.warning("⏰ Classification timeout, using MEDIUM as default")
+            return "MEDIUM"
         except Exception as e:
             logger.error(f"❌ Classification error: {e}")
             return "MEDIUM"
@@ -118,26 +126,20 @@ class SmartModelSelector:
         tier = SmartModelSelector.classify_query_with_gemini(query)
         logger.info(f"🎯 Gemini classified as: {tier} for '{query[:50]}...'")
         
-        # Map tier to your exact model chains (unchanged)
+        # Map tier to model and parameters
         model_configs = {
             "HARD": {
-                "tier": "HARD",
-                "models": SmartModelSelector.TIERS["HARD"],
-                "primary": "gemini-2.5-pro",
+                "model": "gemini-2.5-pro",
                 "tokens": 2000,
                 "timeout": 30
             },
             "MEDIUM": {
-                "tier": "MEDIUM",
-                "models": SmartModelSelector.TIERS["MEDIUM"],
-                "primary": "gemini-2.5-flash",
+                "model": "gemini-2.5-flash", 
                 "tokens": 1000,
                 "timeout": 20
             },
             "SIMPLE": {
-                "tier": "SIMPLE",
-                "models": SmartModelSelector.TIERS["SIMPLE"],
-                "primary": "gemini-2.5-flash-lite",
+                "model": "gemini-2.5-flash-lite",
                 "tokens": 500,
                 "timeout": 10
             }
@@ -147,13 +149,13 @@ class SmartModelSelector:
         
         return {
             "tier": tier,
-            "models": config["models"],
-            "primary": config["primary"],
+            "model": config["model"],
             "tokens": config["tokens"],
-            "timeout": config["timeout"]
+            "timeout": config["timeout"],
+            "fallbacks": ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
         }
 
-# ================= GEMINI API CLIENT (UNCHANGED) =================
+# ================= GEMINI API CLIENT =================
 gemini_cache = {}
 CACHE_DURATION = 300
 
@@ -161,7 +163,7 @@ def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=1000, timeout=20
     """Call Gemini API with a specific model."""
     try:
         if not GEMINI_API_KEY:
-            return "Gemini API key not configured."
+            return "Gemini API key not configured.", "NO_API_KEY"
         
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
         
@@ -219,18 +221,18 @@ def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=1000, timeout=20
         return None, "ERROR"
 
 def ask_gemini_smart(query):
-    """Smart Gemini query with YOUR tiered model selection."""
+    """Smart Gemini query with Gemini-powered tier selection."""
     try:
         if not query or not query.strip():
             return "Please provide a question."
         
-        # Step 1: Select tier and model (NOW USING GEMINI CLASSIFICATION)
+        # Step 1: Get classification and model selection
         model_info = SmartModelSelector.select_model(query)
         tier = model_info["tier"]
-        models_to_try = model_info["models"]
-        primary_model = model_info["primary"]
+        primary_model = model_info["model"]
         max_tokens = model_info["tokens"]
         timeout = model_info["timeout"]
+        fallbacks = model_info["fallbacks"]
         
         logger.info(f"🤖 Using {tier} tier: {primary_model} for '{query[:50]}...'")
         
@@ -242,20 +244,19 @@ def ask_gemini_smart(query):
                 logger.info(f"♻️ Cached response from {primary_model}")
                 return f"[{tier} - Cached] {response}"
         
-        # Step 2: Try models in tier order
+        # Step 2: Try primary model
+        models_to_try = [primary_model] + fallbacks
+        
         for model in models_to_try:
             logger.info(f"🔄 Trying model: {model}")
             
-            # Adjust tokens/timeout based on model
-            if model == "gemini-2.5-pro":
-                model_tokens = max_tokens
-                model_timeout = timeout
-            elif model == "gemini-2.5-flash":
-                model_tokens = min(max_tokens, 1000)
-                model_timeout = min(timeout, 20)
-            else:  # flash-lite or 2.0-flash
+            # Adjust tokens/timeout for fallback models
+            if model != primary_model:
                 model_tokens = min(max_tokens, 500)
                 model_timeout = min(timeout, 15)
+            else:
+                model_tokens = max_tokens
+                model_timeout = timeout
             
             result, status = call_gemini_api(query, model, model_tokens, model_timeout)
             
@@ -267,46 +268,28 @@ def ask_gemini_smart(query):
                 return f"[{tier} - {model}] {result}"
             
             elif status == "MODEL_NOT_AVAILABLE":
-                logger.warning(f"❌ Model {model} not available, trying next in tier")
+                logger.warning(f"❌ Model {model} not available, trying next")
                 continue
             
             elif status == "TIMEOUT":
-                logger.warning(f"⏰ Model {model} timeout, trying next in tier")
+                logger.warning(f"⏰ Model {model} timeout, trying next")
                 continue
             
             elif status == "RATE_LIMITED":
-                # If rate limited, wait and try same model again
-                logger.info(f"⏳ Rate limited on {model}, waiting 2s")
-                time.sleep(2)
-                result, status = call_gemini_api(query, model, model_tokens, model_timeout)
-                if status == "SUCCESS" and result:
-                    gemini_cache[cache_key] = (datetime.now(), result)
-                    return f"[{tier} - {model}] {result}"
+                logger.warning(f"⏰ Model {model} rate limited, trying next")
                 continue
         
-        # If all models in tier failed, fall back to basic
-        logger.warning(f"❌ All models in {tier} tier failed, using basic fallback")
-        return ask_gemini_basic(query)
+        # If all models failed
+        logger.error(f"❌ All models failed for query: {query}")
+        return "Gemini AI is currently unavailable. Please try again in a moment."
         
     except Exception as e:
         logger.error(f"❌ Smart Gemini error: {e}")
         return f"AI error: {str(e)[:80]}"
 
-def ask_gemini_basic(query):
-    """Basic fallback if smart selection fails."""
-    # Try the most reliable free models
-    fallback_models = ["gemini-1.5-flash", "gemini-2.0-flash"]
-    
-    for model in fallback_models:
-        result, status = call_gemini_api(query, model, 500, 10)
-        if status == "SUCCESS" and result:
-            return f"[Fallback - {model}] {result}"
-    
-    return "Gemini AI is currently unavailable. Please try again in a moment."
-
-# ================= OTHER TOOLS (OPTIMIZED) - UNCHANGED =================
+# ================= OTHER TOOLS =================
 def google_search(query, max_results=10):
-    """Google Search - EXACTLY AS YOU HAD IT."""
+    """Google Search."""
     try:
         if not GOOGLE_API_KEY or not CSE_ID:
             return "Google Search not configured."
@@ -345,7 +328,7 @@ def google_search(query, max_results=10):
         return "Google search error."
 
 def wikipedia_search(query, max_results=3):
-    """Wikipedia Search - EXACTLY AS YOU HAD IT."""
+    """Wikipedia Search."""
     try:
         url = "https://en.wikipedia.org/w/api.php"
         headers = {'User-Agent': 'XiaozhiBot/3.6'}
@@ -413,7 +396,7 @@ def wikipedia_search(query, max_results=3):
         logger.error(f"Wikipedia error: {e}")
         return "Wikipedia search error."
 
-# ================= MCP PROTOCOL HANDLER (UNCHANGED) =================
+# ================= MCP PROTOCOL HANDLER =================
 class MCPProtocolHandler:
     @staticmethod
     def handle_initialize(message_id):
@@ -425,7 +408,7 @@ class MCPProtocolHandler:
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "smart-tier-gemini",
-                    "version": "3.6.0"
+                    "version": "3.6.1"
                 }
             }
         }
@@ -518,7 +501,6 @@ class MCPProtocolHandler:
                 "error": {"code": -32000, "message": f"Error: {str(e)[:80]}"}
             }
 
-# ================= WEB SERVER (UNCHANGED) =================
 # ================= WEB SERVER WITH REAL-TIME FEATURES =================
 app = Flask(__name__)
 server_start_time = time.time()
@@ -554,7 +536,10 @@ def add_log(level, message):
 
 # Initialize some logs
 add_log('INFO', 'Server starting...')
-add_log('INFO', f'Gemini API: {'✅ Configured' if GEMINI_API_KEY else '❌ Not configured'}')
+if GEMINI_API_KEY:
+    add_log('INFO', 'Gemini API: ✅ Configured')
+else:
+    add_log('WARNING', 'Gemini API: ❌ Not configured')
 
 @app.route('/')
 def index():
@@ -1033,7 +1018,7 @@ def index():
     seconds=seconds,
     cache_size=len(gemini_cache),
     log_count=len(log_buffer),
-    logs=log_buffer[-20:],  // Last 20 logs
+    logs=log_buffer[-20:],
     test_queries=test_queries,
     timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
@@ -1225,7 +1210,7 @@ def api_uptime():
 
 @app.route('/api/logs')
 def api_logs():
-    return jsonify(log_buffer[-30:])  # Last 30 logs
+    return jsonify(log_buffer[-30:])
 
 @app.route('/api/stats')
 def api_stats():
@@ -1253,10 +1238,10 @@ def api_diagnostics():
     return jsonify({
         'python_version': sys.version,
         'environment_vars': {
-            'GEMINI_API_KEY': '✅ Set' if GEMINI_API_KEY else '❌ Missing',
-            'GOOGLE_API_KEY': '✅ Set' if GOOGLE_API_KEY else '❌ Missing',
-            'CSE_ID': '✅ Set' if CSE_ID else '❌ Missing',
-            'XIAOZHI_WS': '✅ Set' if XIAOZHI_WS else '❌ Missing'
+            'GEMINI_API_KEY': 'Set' if GEMINI_API_KEY else 'Missing',
+            'GOOGLE_API_KEY': 'Set' if GOOGLE_API_KEY else 'Missing',
+            'CSE_ID': 'Set' if CSE_ID else 'Missing',
+            'XIAOZHI_WS': 'Set' if XIAOZHI_WS else 'Missing'
         },
         'cache_info': {
             'size': len(gemini_cache),
@@ -1350,7 +1335,6 @@ async def mcp_bridge():
 async def main():
     logger.info("🚀 Starting Xiaozhi MCP v3.6.1 - Gemini-Powered Smart Tiers")
     add_log('INFO', 'Server starting: Xiaozhi MCP v3.6.1')
-    logger.info(f"📊 Gemini: {'✅ Configured' if GEMINI_API_KEY else '❌ Not configured'}")
     
     # Start web server
     web_thread = threading.Thread(target=run_web_server, daemon=True)
