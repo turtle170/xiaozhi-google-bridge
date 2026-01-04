@@ -44,11 +44,11 @@ logger = logging.getLogger(__name__)
 class SmartModelSelector:
     """Smart model selection using Gemini 2.5 Flash-Lite for classification."""
     
-    # Model tiers based on classification
+    # TIERS BASED ON YOUR SPECIFICATION:
     TIERS = {
-        "HARD": "gemini-2.5-pro",
-        "MEDIUM": "gemini-2.5-flash", 
-        "SIMPLE": "gemini-2.5-flash-lite"
+        "HARD": "gemini-3.0-flash",      # HARD tasks → Gemini 3 Flash (default thinking mode)
+        "MEDIUM": "gemini-2.5-flash",    # MEDIUM tasks → Gemini 2.5 Flash
+        "SIMPLE": "gemini-2.5-flash-lite" # SIMPLE tasks → Gemini 2.5 Flash-Lite
     }
     
     @staticmethod
@@ -61,7 +61,7 @@ class SmartModelSelector:
             
             # Prepare the classification prompt
             classification_prompt = f"""Please help me sort this query into 3 tiers: 
-Hard (handled by Gemini 2.5 Pro), 
+Hard (handled by Gemini 3 Flash), 
 Medium (Handled by Gemini 2.5 Flash), and 
 Simple (Handled by Gemini 2.5 Flash-Lite): "{query}"
 
@@ -106,11 +106,8 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
                         for tier in ["HARD", "MEDIUM", "SIMPLE"]:
                             if tier in classification:
                                 return tier
-                        
-                        # Fallback if not found
-                        logger.warning(f"Unexpected classification: {classification}")
             
-            return "MEDIUM"  # Default fallback
+            return "MEDIUM"
             
         except requests.exceptions.Timeout:
             logger.warning("⏰ Classification timeout, using MEDIUM as default")
@@ -126,22 +123,25 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
         tier = SmartModelSelector.classify_query_with_gemini(query)
         logger.info(f"🎯 Gemini classified as: {tier} for '{query[:50]}...'")
         
-        # Map tier to model and parameters
+        # Map tier to model and parameters - OPTIMIZED FOR MAX TOKENS
         model_configs = {
             "HARD": {
-                "model": "gemini-2.5-pro",
-                "tokens": 2000,
-                "timeout": 30
+                "model": "gemini-3.0-flash",      # Gemini 3 Flash
+                "tokens": 8192,                   # Max output tokens for 20s response
+                "timeout": 20,
+                "fallbacks": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-1.5-flash"]
             },
             "MEDIUM": {
-                "model": "gemini-2.5-flash", 
-                "tokens": 1000,
-                "timeout": 20
+                "model": "gemini-2.5-flash",      # Gemini 2.5 Flash
+                "tokens": 4096,                   # Good balance for speed
+                "timeout": 15,
+                "fallbacks": ["gemini-2.5-flash-lite", "gemini-2.0-flash", "gemini-1.5-flash"]
             },
             "SIMPLE": {
-                "model": "gemini-2.5-flash-lite",
-                "tokens": 500,
-                "timeout": 10
+                "model": "gemini-2.5-flash-lite", # Gemini 2.5 Flash-Lite
+                "tokens": 2048,                   # Fast response
+                "timeout": 10,
+                "fallbacks": ["gemini-2.0-flash", "gemini-1.5-flash"]
             }
         }
         
@@ -152,15 +152,15 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             "model": config["model"],
             "tokens": config["tokens"],
             "timeout": config["timeout"],
-            "fallbacks": ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+            "fallbacks": config["fallbacks"]
         }
 
 # ================= GEMINI API CLIENT =================
 gemini_cache = {}
 CACHE_DURATION = 300
 
-def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=1000, timeout=20):
-    """Call Gemini API with a specific model."""
+def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=4096, timeout=20):
+    """Call Gemini API with a specific model - OPTIMIZED FOR MAX TOKENS."""
     try:
         if not GEMINI_API_KEY:
             return "Gemini API key not configured.", "NO_API_KEY"
@@ -178,7 +178,7 @@ def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=1000, timeout=20
                 }]
             }],
             "generationConfig": {
-                "maxOutputTokens": max_tokens,
+                "maxOutputTokens": max_tokens,  # Using max tokens for longer responses
                 "temperature": 0.7,
                 "topP": 0.9,
                 "topK": 40,
@@ -221,7 +221,7 @@ def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=1000, timeout=20
         return None, "ERROR"
 
 def ask_gemini_smart(query):
-    """Smart Gemini query with Gemini-powered tier selection."""
+    """Smart Gemini query with Gemini-powered tier selection - OPTIMIZED FOR MAX TOKENS."""
     try:
         if not query or not query.strip():
             return "Please provide a question."
@@ -234,7 +234,7 @@ def ask_gemini_smart(query):
         timeout = model_info["timeout"]
         fallbacks = model_info["fallbacks"]
         
-        logger.info(f"🤖 Using {tier} tier: {primary_model} for '{query[:50]}...'")
+        logger.info(f"🤖 Using {tier} tier: {primary_model} (max tokens: {max_tokens}) for '{query[:50]}...'")
         
         # Check cache first
         cache_key = hashlib.md5(f"{query}_{primary_model}".encode()).hexdigest()
@@ -244,19 +244,34 @@ def ask_gemini_smart(query):
                 logger.info(f"♻️ Cached response from {primary_model}")
                 return f"[{tier} - Cached] {response}"
         
-        # Step 2: Try primary model
+        # Step 2: Try primary model with max tokens
         models_to_try = [primary_model] + fallbacks
         
         for model in models_to_try:
             logger.info(f"🔄 Trying model: {model}")
             
-            # Adjust tokens/timeout for fallback models
-            if model != primary_model:
-                model_tokens = min(max_tokens, 500)
-                model_timeout = min(timeout, 15)
+            # Adjust tokens/timeout for optimal performance
+            model_max_limits = {
+                "gemini-3.0-flash": 8192,
+                "gemini-2.5-pro": 8192,
+                "gemini-2.5-flash": 4096,
+                "gemini-2.5-flash-lite": 2048,
+                "gemini-2.0-flash": 2048,
+                "gemini-1.5-flash": 2048
+            }
+            
+            # Use max tokens for the model, but don't exceed what's specified for the tier
+            model_tokens = min(max_tokens, model_max_limits.get(model, 2048))
+            
+            # Adjust timeout based on model complexity
+            if model == "gemini-3.0-flash":
+                model_timeout = min(timeout, 25)  # Gemini 3 Flash can handle longer
+            elif model == "gemini-2.5-pro":
+                model_timeout = min(timeout, 25)
             else:
-                model_tokens = max_tokens
-                model_timeout = timeout
+                model_timeout = min(timeout, 15)
+            
+            logger.info(f"📝 Using {model_tokens} output tokens for {model} (timeout: {model_timeout}s)")
             
             result, status = call_gemini_api(query, model, model_tokens, model_timeout)
             
@@ -272,7 +287,7 @@ def ask_gemini_smart(query):
                 continue
             
             elif status == "TIMEOUT":
-                logger.warning(f"⏰ Model {model} timeout, trying next")
+                logger.warning(f"⏰ Model {model} timeout after {model_timeout}s, trying next")
                 continue
             
             elif status == "RATE_LIMITED":
@@ -444,7 +459,7 @@ class MCPProtocolHandler:
                     },
                     {
                         "name": "ask_ai",
-                        "description": "Ask AI with SMART tiered model selection (Auto-chooses Pro/Flash/Flash-Lite)",
+                        "description": "Ask AI with SMART tiered model selection (Auto-chooses Gemini 3 Flash/2.5 Flash/Flash-Lite)",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -794,7 +809,7 @@ def index():
                 <div style="background:var(--light);padding:15px;border-radius:8px;">
                     <div><strong>Version:</strong> 3.6.1 (Gemini-powered tiers)</div>
                     <div><strong>MCP Protocol:</strong> 2024-11-05</div>
-                    <div><strong>Models Available:</strong> Gemini 2.5 Pro/Flash/Flash-Lite</div>
+                    <div><strong>Models Available:</strong> Gemini 3 Flash / 2.5 Flash / 2.5 Flash-Lite</div>
                     <div><strong>Last Updated:</strong> {{timestamp}}</div>
                 </div>
             </div>
