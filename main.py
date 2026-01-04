@@ -1,4 +1,4 @@
-# main.py - XIAOZHI MCP SERVER v3.6 - GEMINI-POWERED TIER SELECTION
+# main.py - XIAOZHI MCP SERVER v3.6.1 - WITH KEEP-ALIVE PINGS
 import os
 import asyncio
 import json
@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import re
 import hashlib
 from datetime import datetime, timedelta
+import concurrent.futures
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 load_dotenv()
@@ -155,12 +156,24 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             "fallbacks": config["fallbacks"]
         }
 
-# ================= GEMINI API CLIENT =================
+# ================= GEMINI API CLIENT WITH KEEP-ALIVE =================
 gemini_cache = {}
 CACHE_DURATION = 300
 
-def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=4096, timeout=20):
-    """Call Gemini API with a specific model - OPTIMIZED FOR MAX TOKENS."""
+# Track active requests for keep-alive pings
+active_requests = {}
+keep_alive_messages = [
+    "Hi! Our AI is still responding, please wait for a bit!",
+    "Processing your request...",
+    "Generating a thoughtful response...",
+    "Almost there!",
+    "Crafting the perfect answer...",
+    "Thinking deeply about your question..."
+]
+
+def call_gemini_api_with_keepalive(query, model="gemini-2.5-flash", max_tokens=4096, timeout=20, 
+                                   request_id=None, websocket=None):
+    """Call Gemini API with keep-alive pings to prevent Xiaozhi timeout."""
     try:
         if not GEMINI_API_KEY:
             return "Gemini API key not configured.", "NO_API_KEY"
@@ -178,7 +191,136 @@ def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=4096, timeout=20
                 }]
             }],
             "generationConfig": {
-                "maxOutputTokens": max_tokens,  # Using max tokens for longer responses
+                "maxOutputTokens": max_tokens,
+                "temperature": 0.7,
+                "topP": 0.9,
+                "topK": 40,
+            }
+        }
+        
+        params = {"key": GEMINI_API_KEY}
+        
+        # Start keep-alive ping thread if we have a websocket
+        if websocket and request_id:
+            keep_alive_thread = threading.Thread(
+                target=send_keep_alive_pings,
+                args=(websocket, request_id, timeout),
+                daemon=True
+            )
+            keep_alive_thread.start()
+            logger.info(f"🔄 Started keep-alive pings for request {request_id}")
+        
+        response = requests.post(url, headers=headers, json=data, params=params, timeout=timeout)
+        
+        # Clean up the keep-alive tracking
+        if request_id and request_id in active_requests:
+            active_requests[request_id] = False
+        
+        # Handle 404 - model not available
+        if response.status_code == 404:
+            logger.warning(f"❌ Model {model} not available (404)")
+            return None, "MODEL_NOT_AVAILABLE"
+        
+        # Handle rate limits
+        if response.status_code == 429:
+            logger.warning(f"⏰ Model {model} rate limited (429)")
+            return None, "RATE_LIMITED"
+        
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if "candidates" in result and len(result["candidates"]) > 0:
+            candidate = result["candidates"][0]
+            if "content" in candidate:
+                parts = candidate["content"].get("parts", [])
+                if parts and len(parts) > 0 and "text" in parts[0]:
+                    answer = parts[0]["text"]
+                    return answer, "SUCCESS"
+        
+        return None, "PARSE_ERROR"
+        
+    except requests.exceptions.Timeout:
+        logger.warning(f"⏰ Model {model} timeout after {timeout}s")
+        if request_id and request_id in active_requests:
+            active_requests[request_id] = False
+        return None, "TIMEOUT"
+    except Exception as e:
+        logger.error(f"❌ Model {model} error: {e}")
+        if request_id and request_id in active_requests:
+            active_requests[request_id] = False
+        return None, "ERROR"
+
+def send_keep_alive_pings(websocket, request_id, total_timeout):
+    """Send keep-alive messages every 2 seconds to prevent Xiaozhi timeout."""
+    try:
+        # Mark this request as active
+        active_requests[request_id] = True
+        
+        start_time = time.time()
+        ping_count = 0
+        
+        while (time.time() - start_time) < total_timeout:
+            if not active_requests.get(request_id, True):
+                # Request completed or cancelled
+                break
+                
+            # Send a keep-alive ping every 2 seconds
+            if ping_count % 2 == 0:  # Every 4 seconds (2 pings * 2 seconds)
+                keep_alive_msg = keep_alive_messages[ping_count % len(keep_alive_messages)]
+                ping_message = {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {
+                        "progress": {
+                            "type": "text",
+                            "text": f"⏳ {keep_alive_msg}"
+                        }
+                    }
+                }
+                
+                try:
+                    # Try to send the ping
+                    asyncio.run_coroutine_threadsafe(
+                        websocket.send(json.dumps(ping_message)),
+                        asyncio.get_event_loop()
+                    )
+                    logger.debug(f"📤 Sent keep-alive ping #{ping_count//2 + 1} for request {request_id}")
+                except Exception as e:
+                    logger.warning(f"Could not send keep-alive ping: {e}")
+            
+            ping_count += 1
+            time.sleep(2)  # Wait 2 seconds between checks
+        
+        # Clean up
+        if request_id in active_requests:
+            del active_requests[request_id]
+            
+    except Exception as e:
+        logger.error(f"❌ Keep-alive thread error: {e}")
+        if request_id in active_requests:
+            del active_requests[request_id]
+
+def call_gemini_api_sync(query, model="gemini-2.5-flash", max_tokens=4096, timeout=20):
+    """Synchronous wrapper for Gemini API calls."""
+    try:
+        if not GEMINI_API_KEY:
+            return "Gemini API key not configured.", "NO_API_KEY"
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "contents": [{
+                "parts": [{
+                    "text": query
+                }]
+            }],
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
                 "temperature": 0.7,
                 "topP": 0.9,
                 "topK": 40,
@@ -220,60 +362,84 @@ def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=4096, timeout=20
         logger.error(f"❌ Model {model} error: {e}")
         return None, "ERROR"
 
-def ask_gemini_smart(query):
-    """Smart Gemini query with Gemini-powered tier selection - OPTIMIZED FOR MAX TOKENS."""
-    try:
-        if not query or not query.strip():
-            return "Please provide a question."
+# ================= ASYNC GEMINI PROCESSING =================
+async def process_gemini_with_keepalive(query, model_info, cache_key, websocket, message_id):
+    """Process Gemini request with keep-alive pings."""
+    tier = model_info["tier"]
+    primary_model = model_info["model"]
+    max_tokens = model_info["tokens"]
+    timeout = model_info["timeout"]
+    fallbacks = model_info["fallbacks"]
+    
+    logger.info(f"🤖 Processing {tier} tier: {primary_model} for '{query[:50]}...'")
+    
+    # Check cache first
+    if cache_key in gemini_cache:
+        cached_time, response = gemini_cache[cache_key]
+        if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
+            logger.info(f"♻️ Cached response from {primary_model}")
+            return f"[{tier} - Cached] {response}"
+    
+    # Generate a unique request ID for keep-alive tracking
+    import uuid
+    request_id = str(uuid.uuid4())[:8]
+    
+    # Try models in order
+    models_to_try = [primary_model] + fallbacks
+    
+    for model in models_to_try:
+        logger.info(f"🔄 Trying model: {model}")
         
-        # Step 1: Get classification and model selection
-        model_info = SmartModelSelector.select_model(query)
-        tier = model_info["tier"]
-        primary_model = model_info["model"]
-        max_tokens = model_info["tokens"]
-        timeout = model_info["timeout"]
-        fallbacks = model_info["fallbacks"]
+        # Adjust tokens/timeout for optimal performance
+        model_max_limits = {
+            "gemini-3.0-flash": 8192,
+            "gemini-2.5-pro": 8192,
+            "gemini-2.5-flash": 4096,
+            "gemini-2.5-flash-lite": 2048,
+            "gemini-2.0-flash": 2048,
+            "gemini-1.5-flash": 2048
+        }
         
-        logger.info(f"🤖 Using {tier} tier: {primary_model} (max tokens: {max_tokens}) for '{query[:50]}...'")
+        # Use max tokens for the model
+        model_tokens = min(max_tokens, model_max_limits.get(model, 2048))
         
-        # Check cache first
-        cache_key = hashlib.md5(f"{query}_{primary_model}".encode()).hexdigest()
-        if cache_key in gemini_cache:
-            cached_time, response = gemini_cache[cache_key]
-            if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
-                logger.info(f"♻️ Cached response from {primary_model}")
-                return f"[{tier} - Cached] {response}"
+        # Adjust timeout based on model complexity
+        if model == "gemini-3.0-flash":
+            model_timeout = min(timeout, 25)
+        elif model == "gemini-2.5-pro":
+            model_timeout = min(timeout, 25)
+        else:
+            model_timeout = min(timeout, 15)
         
-        # Step 2: Try primary model with max tokens
-        models_to_try = [primary_model] + fallbacks
+        logger.info(f"📝 Using {model_tokens} output tokens for {model} (timeout: {model_timeout}s)")
         
-        for model in models_to_try:
-            logger.info(f"🔄 Trying model: {model}")
-            
-            # Adjust tokens/timeout for optimal performance
-            model_max_limits = {
-                "gemini-3.0-flash": 8192,
-                "gemini-2.5-pro": 8192,
-                "gemini-2.5-flash": 4096,
-                "gemini-2.5-flash-lite": 2048,
-                "gemini-2.0-flash": 2048,
-                "gemini-1.5-flash": 2048
+        # Send initial "processing" message
+        initial_msg = {
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {
+                "progress": {
+                    "type": "text",
+                    "text": f"🤔 Processing with {model}..."
+                }
             }
-            
-            # Use max tokens for the model, but don't exceed what's specified for the tier
-            model_tokens = min(max_tokens, model_max_limits.get(model, 2048))
-            
-            # Adjust timeout based on model complexity
-            if model == "gemini-3.0-flash":
-                model_timeout = min(timeout, 25)  # Gemini 3 Flash can handle longer
-            elif model == "gemini-2.5-pro":
-                model_timeout = min(timeout, 25)
-            else:
-                model_timeout = min(timeout, 15)
-            
-            logger.info(f"📝 Using {model_tokens} output tokens for {model} (timeout: {model_timeout}s)")
-            
-            result, status = call_gemini_api(query, model, model_tokens, model_timeout)
+        }
+        try:
+            await websocket.send(json.dumps(initial_msg))
+        except:
+            pass
+        
+        # Run Gemini API in a thread pool to avoid blocking
+        loop = asyncio.get_event_loop()
+        
+        try:
+            # Submit the Gemini API call to a thread pool
+            result, status = await loop.run_in_executor(
+                None,
+                lambda: call_gemini_api_with_keepalive(
+                    query, model, model_tokens, model_timeout, request_id, websocket
+                )
+            )
             
             if status == "SUCCESS" and result:
                 # Cache successful response
@@ -293,13 +459,77 @@ def ask_gemini_smart(query):
             elif status == "RATE_LIMITED":
                 logger.warning(f"⏰ Model {model} rate limited, trying next")
                 continue
+                
+        except Exception as e:
+            logger.error(f"❌ Async processing error for {model}: {e}")
+            continue
+    
+    # If all models failed
+    logger.error(f"❌ All models failed for query: {query}")
+    return "Gemini AI is currently unavailable. Please try again in a moment."
+
+def ask_gemini_smart_sync(query):
+    """Synchronous version for non-websocket contexts."""
+    try:
+        if not query or not query.strip():
+            return "Please provide a question."
         
-        # If all models failed
-        logger.error(f"❌ All models failed for query: {query}")
+        # Get classification and model selection
+        model_info = SmartModelSelector.select_model(query)
+        tier = model_info["tier"]
+        primary_model = model_info["model"]
+        max_tokens = model_info["tokens"]
+        timeout = model_info["timeout"]
+        fallbacks = model_info["fallbacks"]
+        
+        logger.info(f"🤖 [Sync] Using {tier} tier: {primary_model} for '{query[:50]}...'")
+        
+        # Check cache first
+        cache_key = hashlib.md5(f"{query}_{primary_model}".encode()).hexdigest()
+        if cache_key in gemini_cache:
+            cached_time, response = gemini_cache[cache_key]
+            if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
+                logger.info(f"♻️ Cached response from {primary_model}")
+                return f"[{tier} - Cached] {response}"
+        
+        # Try models in order
+        models_to_try = [primary_model] + fallbacks
+        
+        for model in models_to_try:
+            logger.info(f"🔄 [Sync] Trying model: {model}")
+            
+            # Adjust tokens/timeout
+            model_max_limits = {
+                "gemini-3.0-flash": 8192,
+                "gemini-2.5-pro": 8192,
+                "gemini-2.5-flash": 4096,
+                "gemini-2.5-flash-lite": 2048,
+                "gemini-2.0-flash": 2048,
+                "gemini-1.5-flash": 2048
+            }
+            
+            model_tokens = min(max_tokens, model_max_limits.get(model, 2048))
+            
+            if model == "gemini-3.0-flash":
+                model_timeout = min(timeout, 25)
+            elif model == "gemini-2.5-pro":
+                model_timeout = min(timeout, 25)
+            else:
+                model_timeout = min(timeout, 15)
+            
+            result, status = call_gemini_api_sync(query, model, model_tokens, model_timeout)
+            
+            if status == "SUCCESS" and result:
+                gemini_cache[cache_key] = (datetime.now(), result)
+                return f"[{tier} - {model}] {result}"
+            
+            elif status in ["MODEL_NOT_AVAILABLE", "TIMEOUT", "RATE_LIMITED"]:
+                continue
+        
         return "Gemini AI is currently unavailable. Please try again in a moment."
         
     except Exception as e:
-        logger.error(f"❌ Smart Gemini error: {e}")
+        logger.error(f"❌ Smart Gemini sync error: {e}")
         return f"AI error: {str(e)[:80]}"
 
 # ================= OTHER TOOLS =================
@@ -411,7 +641,7 @@ def wikipedia_search(query, max_results=3):
         logger.error(f"Wikipedia error: {e}")
         return "Wikipedia search error."
 
-# ================= MCP PROTOCOL HANDLER =================
+# ================= MCP PROTOCOL HANDLER WITH KEEP-ALIVE =================
 class MCPProtocolHandler:
     @staticmethod
     def handle_initialize(message_id):
@@ -423,7 +653,7 @@ class MCPProtocolHandler:
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "smart-tier-gemini",
-                    "version": "3.6.1"
+                    "version": "3.6.1-keepalive"
                 }
             }
         }
@@ -459,7 +689,7 @@ class MCPProtocolHandler:
                     },
                     {
                         "name": "ask_ai",
-                        "description": "Ask AI with SMART tiered model selection (Auto-chooses Gemini 3 Flash/2.5 Flash/Flash-Lite)",
+                        "description": "Ask AI with SMART tiered model selection (Auto-chooses Gemini 3 Flash/2.5 Flash/Flash-Lite) - Now with keep-alive pings!",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -477,7 +707,8 @@ class MCPProtocolHandler:
         return {"jsonrpc": "2.0", "id": message_id, "result": {}}
     
     @staticmethod
-    def handle_tools_call(message_id, params):
+    async def handle_tools_call_async(message_id, params, websocket):
+        """Async handler for tools/call with keep-alive support."""
         tool_name = params.get("name", "")
         query = params.get("arguments", {}).get("query", "").strip()
         
@@ -494,7 +725,14 @@ class MCPProtocolHandler:
             elif tool_name == "wikipedia_search":
                 result = wikipedia_search(query)
             elif tool_name == "ask_ai":
-                result = ask_gemini_smart(query)
+                # Get model info for this query
+                model_info = SmartModelSelector.select_model(query)
+                cache_key = hashlib.md5(f"{query}_{model_info['model']}".encode()).hexdigest()
+                
+                # Process with keep-alive pings
+                result = await process_gemini_with_keepalive(
+                    query, model_info, cache_key, websocket, message_id
+                )
             else:
                 return {
                     "jsonrpc": "2.0",
@@ -550,7 +788,7 @@ def add_log(level, message):
         log_buffer.pop(0)
 
 # Initialize some logs
-add_log('INFO', 'Server starting...')
+add_log('INFO', 'Server starting with keep-alive support...')
 if GEMINI_API_KEY:
     add_log('INFO', 'Gemini API: ✅ Configured')
 else:
@@ -766,7 +1004,7 @@ def index():
             <!-- Header -->
             <div class="header">
                 <h1 style="margin:0;color:var(--primary);">🚀 Xiaozhi MCP v3.6.1</h1>
-                <p style="color:#666;margin:5px 0 20px 0;">Real-time Dashboard</p>
+                <p style="color:#666;margin:5px 0 20px 0;">With Keep-Alive Pings ⏰</p>
                 
                 <div class="status-grid">
                     <div class="status-item">
@@ -778,8 +1016,8 @@ def index():
                         <div style="font-size:24px;color:var(--primary);">{{cache_size}} items</div>
                     </div>
                     <div class="status-item">
-                        <div style="color:#666;font-size:14px;">Log Entries</div>
-                        <div style="font-size:24px;color:var(--primary);">{{log_count}}</div>
+                        <div style="color:#666;font-size:14px;">Active Requests</div>
+                        <div style="font-size:24px;color:var(--primary);" id="activeRequests">0</div>
                     </div>
                     <div class="status-item">
                         <div style="color:#666;font-size:14px;">Status</div>
@@ -789,7 +1027,7 @@ def index():
                 
                 <div class="real-time">
                     <div class="pulse"></div>
-                    <span>Real-time updating</span>
+                    <span>Keep-alive pings active (prevents 5s timeout)</span>
                     <button class="refresh-btn" onclick="refreshData()">🔄 Refresh</button>
                 </div>
             </div>
@@ -807,9 +1045,10 @@ def index():
                 
                 <h3 style="margin-top:25px;color:var(--primary);">⚡ System Info</h3>
                 <div style="background:var(--light);padding:15px;border-radius:8px;">
-                    <div><strong>Version:</strong> 3.6.1 (Gemini-powered tiers)</div>
+                    <div><strong>Version:</strong> 3.6.1-keepalive</div>
                     <div><strong>MCP Protocol:</strong> 2024-11-05</div>
-                    <div><strong>Models Available:</strong> Gemini 3 Flash / 2.5 Flash / 2.5 Flash-Lite</div>
+                    <div><strong>Keep-Alive:</strong> ✅ Enabled (2s pings)</div>
+                    <div><strong>Models:</strong> Gemini 3 Flash / 2.5 Flash / 2.5 Flash-Lite</div>
                     <div><strong>Last Updated:</strong> {{timestamp}}</div>
                 </div>
             </div>
@@ -870,11 +1109,11 @@ def index():
                         </div>
                         <div style="margin:10px 0;">
                             <div style="display:flex;justify-content:space-between;">
-                                <span>WebSocket Connection:</span>
-                                <span id="wsStatus" style="color:var(--success);">● Connected</span>
+                                <span>Keep-Alive System:</span>
+                                <span id="keepAliveStatus" style="color:var(--success);">● Active</span>
                             </div>
                             <div style="height:8px;background:#eee;border-radius:4px;margin:5px 0;">
-                                <div style="width:92%;height:100%;background:var(--success);border-radius:4px;"></div>
+                                <div style="width:95%;height:100%;background:var(--success);border-radius:4px;"></div>
                             </div>
                         </div>
                     </div>
@@ -908,6 +1147,15 @@ def index():
                     });
             }
             
+            // Update active requests count
+            function updateActiveRequests() {
+                fetch('/api/active-requests')
+                    .then(r => r.json())
+                    .then(data => {
+                        document.getElementById('activeRequests').textContent = data.count;
+                    });
+            }
+            
             // Update logs
             function refreshLogs() {
                 fetch('/api/logs')
@@ -929,7 +1177,7 @@ def index():
             function runTest(query) {
                 const resultDiv = document.getElementById('testResult');
                 resultDiv.style.display = 'block';
-                resultDiv.innerHTML = `<div style="color:var(--warning);">⏳ Testing: "${query}"...</div>`;
+                resultDiv.innerHTML = `<div style="color:var(--warning);">⏳ Testing: "${query}" (with keep-alive)...</div>`;
                 
                 fetch('/test-smart/' + encodeURIComponent(query))
                     .then(r => r.json())
@@ -959,6 +1207,7 @@ def index():
             
             function refreshData() {
                 updateUptime();
+                updateActiveRequests();
                 refreshLogs();
                 fetch('/api/stats')
                     .then(r => r.json())
@@ -1018,12 +1267,14 @@ def index():
                 panel.scrollTop = panel.scrollHeight;
             }
             
-            // Auto-refresh every 10 seconds
-            setInterval(updateUptime, 10000);
-            setInterval(refreshLogs, 15000);
+            // Auto-refresh every 5 seconds
+            setInterval(updateUptime, 5000);
+            setInterval(updateActiveRequests, 3000);
+            setInterval(refreshLogs, 10000);
             
             // Initial load
             updateUptime();
+            updateActiveRequests();
         </script>
     </body>
     </html>
@@ -1045,11 +1296,12 @@ def health_check():
     
     return jsonify({
         "status": "healthy",
-        "version": "3.6.1",
+        "version": "3.6.1-keepalive",
         "uptime_seconds": uptime,
         "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
         "cache_size": len(gemini_cache),
         "log_count": len(log_buffer),
+        "active_requests": len(active_requests),
         "gemini_configured": bool(GEMINI_API_KEY),
         "google_configured": bool(GOOGLE_API_KEY and CSE_ID),
         "last_log": log_buffer[-1]['message'] if log_buffer else "No logs",
@@ -1126,7 +1378,8 @@ def statistics():
         "system": {
             "gemini_api_configured": bool(GEMINI_API_KEY),
             "google_api_configured": bool(GOOGLE_API_KEY),
-            "test_queries_count": len(test_queries)
+            "test_queries_count": len(test_queries),
+            "active_requests_count": len(active_requests)
         }
     }), 200
 
@@ -1195,16 +1448,23 @@ def api_docs():
         </div>
         
         <div class="endpoint">
+            <div class="method">GET</div>
+            <code>/api/active-requests</code> - Get active request count
+        </div>
+        
+        <div class="endpoint">
             <div class="method">POST</div>
             <code>/api/clear-cache</code> - Clear Gemini cache
         </div>
         
-        <h2>🔧 MCP Protocol</h2>
-        <p>The server implements Model Context Protocol (MCP) over WebSocket:</p>
+        <h2>🔧 MCP Protocol with Keep-Alive</h2>
+        <p>The server implements Model Context Protocol (MCP) over WebSocket with keep-alive pings:</p>
         <ul>
             <li><strong>Tools:</strong> google_search, wikipedia_search, ask_ai</li>
             <li><strong>Protocol Version:</strong> 2024-11-05</li>
             <li><strong>Tier Selection:</strong> Gemini-powered (HARD/MEDIUM/SIMPLE)</li>
+            <li><strong>Keep-Alive:</strong> Sends progress pings every 2s during long AI responses</li>
+            <li><strong>Prevents:</strong> Xiaozhi's 5-second timeout</li>
         </ul>
     </body>
     </html>
@@ -1232,9 +1492,14 @@ def api_stats():
     return jsonify({
         'cache_size': len(gemini_cache),
         'log_count': len(log_buffer),
+        'active_requests': len(active_requests),
         'test_queries': len(test_queries),
         'server_time': datetime.now().isoformat()
     })
+
+@app.route('/api/active-requests')
+def api_active_requests():
+    return jsonify({'count': len(active_requests)})
 
 @app.route('/api/clear-cache', methods=['POST'])
 def api_clear_cache():
@@ -1265,6 +1530,10 @@ def api_diagnostics():
         'log_info': {
             'total': len(log_buffer),
             'recent': [log['message'] for log in log_buffer[-3:]]
+        },
+        'keep_alive_info': {
+            'active_requests': len(active_requests),
+            'messages': keep_alive_messages
         }
     })
 
@@ -1272,7 +1541,7 @@ def api_diagnostics():
 def test_smart(query):
     """Test the smart tier selection."""
     add_log('INFO', f'Test query: {query[:50]}...')
-    result = ask_gemini_smart(query)
+    result = ask_gemini_smart_sync(query)
     add_log('INFO', f'Test completed for: {query[:30]}...')
     
     return jsonify({
@@ -1287,16 +1556,16 @@ def run_web_server():
     add_log('INFO', 'Starting web server on port 3000')
     app.run(host='0.0.0.0', port=3000, debug=False, threaded=True)
 
-# ================= MAIN =================
+# ================= MAIN MCP BRIDGE WITH KEEP-ALIVE =================
 async def mcp_bridge():
-    """WebSocket bridge."""
+    """WebSocket bridge with keep-alive support."""
     reconnect_delay = 2
     while True:
         try:
             async with websockets.connect(
                 XIAOZHI_WS,
-                ping_interval=25,
-                ping_timeout=15,
+                ping_interval=20,  # Send pings every 20 seconds
+                ping_timeout=10,
                 close_timeout=10
             ) as websocket:
                 logger.info("✅ Connected to Xiaozhi")
@@ -1321,7 +1590,10 @@ async def mcp_bridge():
                             response = MCPProtocolHandler.handle_tools_list(message_id)
                             add_log('INFO', 'Sent tools list to client')
                         elif method == "tools/call":
-                            response = MCPProtocolHandler.handle_tools_call(message_id, params)
+                            # Use async handler with keep-alive support
+                            response = await MCPProtocolHandler.handle_tools_call_async(
+                                message_id, params, websocket
+                            )
                             tool_name = params.get("name", "")
                             query = params.get("arguments", {}).get("query", "")[:50]
                             add_log('INFO', f'Processed {tool_name}: {query}...')
@@ -1348,8 +1620,8 @@ async def mcp_bridge():
             reconnect_delay = min(reconnect_delay * 1.5, 60)
 
 async def main():
-    logger.info("🚀 Starting Xiaozhi MCP v3.6.1 - Gemini-Powered Smart Tiers")
-    add_log('INFO', 'Server starting: Xiaozhi MCP v3.6.1')
+    logger.info("🚀 Starting Xiaozhi MCP v3.6.1 - With Keep-Alive Pings")
+    add_log('INFO', 'Server starting: Xiaozhi MCP v3.6.1 with keep-alive')
     
     # Start web server
     web_thread = threading.Thread(target=run_web_server, daemon=True)
