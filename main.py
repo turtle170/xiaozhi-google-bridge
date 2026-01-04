@@ -1,28 +1,22 @@
-# main.py - XIAOZHI MCP SERVER v3.7 - GEMINI 3 FLASH 2026 OFFICIAL SDK
+# main.py - XIAOZHI MCP SERVER v3.6 - TIERED MODEL SELECTION
+# ONLY MODIFIED: Classification system to use Gemini 2.5 Flash-Lite
+# EVERYTHING ELSE: Kept exactly as you had it
 import os
 import asyncio
 import json
 import websockets
 import requests
 import logging
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify
 import threading
 import time
 import sys
 from dotenv import load_dotenv
 import re
+import random
 import hashlib
 from datetime import datetime, timedelta
-
-# Import the official Google Gen AI SDK
-try:
-    from google import genai
-    from google.genai import types
-    GEMINI_SDK_AVAILABLE = True
-except ImportError:
-    GEMINI_SDK_AVAILABLE = False
-    logger = logging.getLogger(__name__)
-    logger.error("❌ Google Gen AI SDK not installed. Run: pip install google-generativeai")
+import concurrent.futures
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 load_dotenv()
@@ -33,19 +27,11 @@ GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 CSE_ID = os.environ.get("CSE_ID", "")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
-# Use GEMINI_API_KEY as GOOGLE_API_KEY if not set separately
-if not GOOGLE_API_KEY and GEMINI_API_KEY:
-    GOOGLE_API_KEY = GEMINI_API_KEY
-
 # Validate critical configuration
 if not XIAOZHI_WS:
     print("❌ ERROR: XIAOZHI_WS environment variable is not set!")
     print("   Go to Render.com dashboard → Environment → Add XIAOZHI_WS")
     sys.exit(1)
-
-if not GOOGLE_API_KEY:
-    print("❌ WARNING: GOOGLE_API_KEY environment variable is not set!")
-    print("   Some features may not work properly")
 
 # ================= LOGGING SETUP =================
 logging.basicConfig(
@@ -58,27 +44,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ================= GEMINI 2026 THINKING SYSTEM =================
+# ================= TIERED MODEL SELECTION (UPDATED) =================
 class SmartModelSelector:
     """Smart model selection using Gemini 2.5 Flash-Lite for classification."""
+    
+    # YOUR EXACT TIERS (unchanged)
+    TIERS = {
+        "HARD": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
+        "MEDIUM": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
+        "SIMPLE": ["gemini-2.5-flash-lite"]
+    }
     
     @staticmethod
     def classify_query_with_gemini(query):
         """Use Gemini 2.5 Flash-Lite to classify query into HARD, MEDIUM, or SIMPLE."""
         try:
-            if not GOOGLE_API_KEY:
-                logger.warning("No Google API key, using fallback classification")
+            if not GEMINI_API_KEY:
+                logger.warning("No Gemini API key, using fallback classification")
                 return "MEDIUM"
             
-            # Prepare the classification prompt
-            classification_prompt = f"""Please help me sort this query into 3 tiers for Gemini 3 Flash thinking system: 
-Hard (requires maximum reasoning depth), 
-Medium (requires balanced reasoning), and 
-Simple (can be answered with minimal reasoning): "{query}"
-
-Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text."""
+            # Use your exact prompt
+            classification_prompt = f"""Please help me sort this query into 3 tiers: Hard (handled by Gemini 2.5 Pro), Medium (Handled by Gemini 2.5 Flash), and Simple (Handled by Gemini 2.5 Flash-Lite): "{query}", and strictly only say "HARD","MEDIUM", OR "SIMPLE", no extra."""
             
-            # Use simple requests API for classification (no thinking needed)
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
             
             headers = {
@@ -95,10 +82,11 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text."""
                     "maxOutputTokens": 10,
                     "temperature": 0.1,
                     "topP": 0.1,
+                    "topK": 1,
                 }
             }
             
-            params = {"key": GOOGLE_API_KEY}
+            params = {"key": GEMINI_API_KEY}
             
             response = requests.post(url, headers=headers, json=data, params=params, timeout=3)
             response.raise_for_status()
@@ -124,209 +112,201 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text."""
             return "MEDIUM"
     
     @staticmethod
-    def get_thinking_config(tier):
-        """Get thinking configuration based on tier."""
-        thinking_configs = {
+    def select_model(query):
+        """Select model using Gemini-powered classification."""
+        # Get classification from Gemini
+        tier = SmartModelSelector.classify_query_with_gemini(query)
+        logger.info(f"🎯 Gemini classified as: {tier} for '{query[:50]}...'")
+        
+        # Map tier to your exact model chains (unchanged)
+        model_configs = {
             "HARD": {
-                "thinking_level": "high",
-                "include_thoughts": True,
-                "model": "gemini-3-flash-preview",
-                "temperature": 0.2,
-                "max_tokens": 2000,
-                "timeout": 45
-            },
-            "MEDIUM": {
-                "thinking_level": "medium",
-                "include_thoughts": False,
-                "model": "gemini-3-flash-preview",
-                "temperature": 0.7,
-                "max_tokens": 1500,
+                "tier": "HARD",
+                "models": SmartModelSelector.TIERS["HARD"],
+                "primary": "gemini-2.5-pro",
+                "tokens": 2000,
                 "timeout": 30
             },
+            "MEDIUM": {
+                "tier": "MEDIUM",
+                "models": SmartModelSelector.TIERS["MEDIUM"],
+                "primary": "gemini-2.5-flash",
+                "tokens": 1000,
+                "timeout": 20
+            },
             "SIMPLE": {
-                "thinking_level": "minimal",
-                "include_thoughts": False,
-                "model": "gemini-3-flash-preview",
-                "temperature": 0.9,
-                "max_tokens": 800,
-                "timeout": 15
+                "tier": "SIMPLE",
+                "models": SmartModelSelector.TIERS["SIMPLE"],
+                "primary": "gemini-2.5-flash-lite",
+                "tokens": 500,
+                "timeout": 10
             }
         }
         
-        return thinking_configs.get(tier, thinking_configs["MEDIUM"])
+        config = model_configs.get(tier, model_configs["MEDIUM"])
+        
+        return {
+            "tier": tier,
+            "models": config["models"],
+            "primary": config["primary"],
+            "tokens": config["tokens"],
+            "timeout": config["timeout"]
+        }
 
-# ================= GEMINI 2026 SDK CLIENT =================
+# ================= GEMINI API CLIENT (UNCHANGED) =================
 gemini_cache = {}
 CACHE_DURATION = 300
 
-class Gemini2026Client:
-    """Client for Gemini 2026 with official SDK and thinking system."""
-    
-    def __init__(self):
-        self.client = None
-        if GOOGLE_API_KEY and GEMINI_SDK_AVAILABLE:
-            try:
-                self.client = genai.Client(api_key=GOOGLE_API_KEY)
-                logger.info("✅ Google Gen AI SDK initialized")
-            except Exception as e:
-                logger.error(f"❌ Failed to initialize Gemini SDK: {e}")
-                self.client = None
-    
-    def call_gemini_with_thinking(self, query, thinking_config):
-        """Call Gemini 3 Flash with 2026 thinking system."""
-        try:
-            if not self.client:
-                return None, "SDK_NOT_AVAILABLE"
-            
-            model_id = thinking_config.get("model", "gemini-3-flash-preview")
-            thinking_level = thinking_config.get("thinking_level", "medium")
-            include_thoughts = thinking_config.get("include_thoughts", False)
-            temperature = thinking_config.get("temperature", 0.7)
-            max_tokens = thinking_config.get("max_tokens", 1500)
-            
-            logger.info(f"🤔 Using {model_id} with {thinking_level} thinking (thoughts: {include_thoughts})")
-            
-            # Prepare the configuration
-            config = types.GenerateContentConfig(
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-                thinking_config=types.ThinkingConfig(
-                    include_thoughts=include_thoughts,
-                    thinking_level=thinking_level
-                )
-            )
-            
-            # Make the API call
-            response = self.client.models.generate_content(
-                model=model_id,
-                contents=query,
-                config=config
-            )
-            
-            # Extract the response
-            if hasattr(response, 'text') and response.text:
-                result = response.text
-                
-                # If thoughts were included, extract them
-                if include_thoughts and hasattr(response, 'candidates'):
-                    thoughts = []
-                    for candidate in response.candidates:
-                        if hasattr(candidate, 'content') and candidate.content:
-                            for part in candidate.content.parts:
-                                if hasattr(part, 'thought') and part.thought:
-                                    thoughts.append(part.text)
-                    
-                    if thoughts:
-                        thought_text = "\n\n🤔 **Internal Reasoning:**\n" + "\n".join(thoughts)
-                        result = thought_text + "\n\n💡 **Final Answer:**\n" + result
-                
-                return result, "SUCCESS"
-            else:
-                return None, "NO_RESPONSE"
-                
-        except Exception as e:
-            logger.error(f"❌ Gemini SDK error: {e}")
-            return None, f"ERROR: {str(e)[:100]}"
-    
-    def call_gemini_fallback(self, query, max_tokens=1000, timeout=20):
-        """Fallback using REST API if SDK fails."""
-        try:
-            if not GOOGLE_API_KEY:
-                return None, "NO_API_KEY"
-            
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-            
-            headers = {
-                "Content-Type": "application/json"
+def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=1000, timeout=20):
+    """Call Gemini API with a specific model."""
+    try:
+        if not GEMINI_API_KEY:
+            return "Gemini API key not configured."
+        
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        
+        headers = {
+            "Content-Type": "application/json"
+        }
+        
+        data = {
+            "contents": [{
+                "parts": [{
+                    "text": query
+                }]
+            }],
+            "generationConfig": {
+                "maxOutputTokens": max_tokens,
+                "temperature": 0.7,
+                "topP": 0.9,
+                "topK": 40,
             }
-            
-            data = {
-                "contents": [{
-                    "parts": [{
-                        "text": query
-                    }]
-                }],
-                "generationConfig": {
-                    "maxOutputTokens": max_tokens,
-                    "temperature": 0.7,
-                }
-            }
-            
-            params = {"key": GOOGLE_API_KEY}
-            
-            response = requests.post(url, headers=headers, json=data, params=params, timeout=timeout)
-            response.raise_for_status()
-            
-            result = response.json()
-            
-            if "candidates" in result and len(result["candidates"]) > 0:
-                candidate = result["candidates"][0]
-                if "content" in candidate:
-                    parts = candidate["content"].get("parts", [])
-                    if parts and len(parts) > 0 and "text" in parts[0]:
-                        answer = parts[0]["text"]
-                        return answer, "SUCCESS"
-            
-            return None, "PARSE_ERROR"
-            
-        except Exception as e:
-            logger.error(f"❌ Fallback API error: {e}")
-            return None, "ERROR"
-
-# Initialize the Gemini client
-gemini_client = Gemini2026Client()
+        }
+        
+        params = {"key": GEMINI_API_KEY}
+        
+        response = requests.post(url, headers=headers, json=data, params=params, timeout=timeout)
+        
+        # Handle 404 - model not available
+        if response.status_code == 404:
+            logger.warning(f"❌ Model {model} not available (404)")
+            return None, "MODEL_NOT_AVAILABLE"
+        
+        # Handle rate limits
+        if response.status_code == 429:
+            logger.warning(f"⏰ Model {model} rate limited (429)")
+            return None, "RATE_LIMITED"
+        
+        response.raise_for_status()
+        
+        result = response.json()
+        
+        if "candidates" in result and len(result["candidates"]) > 0:
+            candidate = result["candidates"][0]
+            if "content" in candidate:
+                parts = candidate["content"].get("parts", [])
+                if parts and len(parts) > 0 and "text" in parts[0]:
+                    answer = parts[0]["text"]
+                    return answer, "SUCCESS"
+        
+        return None, "PARSE_ERROR"
+        
+    except requests.exceptions.Timeout:
+        logger.warning(f"⏰ Model {model} timeout after {timeout}s")
+        return None, "TIMEOUT"
+    except Exception as e:
+        logger.error(f"❌ Model {model} error: {e}")
+        return None, "ERROR"
 
 def ask_gemini_smart(query):
-    """Smart Gemini query with 2026 thinking system."""
+    """Smart Gemini query with YOUR tiered model selection."""
     try:
         if not query or not query.strip():
             return "Please provide a question."
         
-        # Step 1: Get classification
-        tier = SmartModelSelector.classify_query_with_gemini(query)
-        thinking_config = SmartModelSelector.get_thinking_config(tier)
+        # Step 1: Select tier and model (NOW USING GEMINI CLASSIFICATION)
+        model_info = SmartModelSelector.select_model(query)
+        tier = model_info["tier"]
+        models_to_try = model_info["models"]
+        primary_model = model_info["primary"]
+        max_tokens = model_info["tokens"]
+        timeout = model_info["timeout"]
         
-        logger.info(f"🎯 Classified as: {tier} tier → {thinking_config['thinking_level']} thinking")
+        logger.info(f"🤖 Using {tier} tier: {primary_model} for '{query[:50]}...'")
         
-        # Step 2: Check cache
-        cache_key = hashlib.md5(f"{query}_{tier}_{thinking_config['thinking_level']}".encode()).hexdigest()
+        # Check cache first
+        cache_key = hashlib.md5(f"{query}_{primary_model}".encode()).hexdigest()
         if cache_key in gemini_cache:
             cached_time, response = gemini_cache[cache_key]
             if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
-                logger.info(f"♻️ Cached response from {tier} tier")
+                logger.info(f"♻️ Cached response from {primary_model}")
                 return f"[{tier} - Cached] {response}"
         
-        # Step 3: Try official SDK with thinking system
-        if gemini_client.client:
-            result, status = gemini_client.call_gemini_with_thinking(query, thinking_config)
+        # Step 2: Try models in tier order
+        for model in models_to_try:
+            logger.info(f"🔄 Trying model: {model}")
+            
+            # Adjust tokens/timeout based on model
+            if model == "gemini-2.5-pro":
+                model_tokens = max_tokens
+                model_timeout = timeout
+            elif model == "gemini-2.5-flash":
+                model_tokens = min(max_tokens, 1000)
+                model_timeout = min(timeout, 20)
+            else:  # flash-lite or 2.0-flash
+                model_tokens = min(max_tokens, 500)
+                model_timeout = min(timeout, 15)
+            
+            result, status = call_gemini_api(query, model, model_tokens, model_timeout)
             
             if status == "SUCCESS" and result:
                 # Cache successful response
                 gemini_cache[cache_key] = (datetime.now(), result)
-                return f"[{tier} - Gemini 3 Flash ({thinking_config['thinking_level']} thinking)] {result}"
+                
+                # Add tier/model info to response
+                return f"[{tier} - {model}] {result}"
+            
+            elif status == "MODEL_NOT_AVAILABLE":
+                logger.warning(f"❌ Model {model} not available, trying next in tier")
+                continue
+            
+            elif status == "TIMEOUT":
+                logger.warning(f"⏰ Model {model} timeout, trying next in tier")
+                continue
+            
+            elif status == "RATE_LIMITED":
+                # If rate limited, wait and try same model again
+                logger.info(f"⏳ Rate limited on {model}, waiting 2s")
+                time.sleep(2)
+                result, status = call_gemini_api(query, model, model_tokens, model_timeout)
+                if status == "SUCCESS" and result:
+                    gemini_cache[cache_key] = (datetime.now(), result)
+                    return f"[{tier} - {model}] {result}"
+                continue
         
-        # Step 4: Fallback to REST API
-        logger.warning("⚠️ SDK failed, using REST API fallback")
-        result, status = gemini_client.call_gemini_fallback(
-            query, 
-            thinking_config.get("max_tokens", 1000),
-            thinking_config.get("timeout", 20)
-        )
-        
-        if status == "SUCCESS" and result:
-            gemini_cache[cache_key] = (datetime.now(), result)
-            return f"[{tier} - Fallback Gemini 2.5 Flash] {result}"
-        
-        # Step 5: Ultimate fallback
-        return f"Gemini AI is currently unavailable. Please try again in a moment."
+        # If all models in tier failed, fall back to basic
+        logger.warning(f"❌ All models in {tier} tier failed, using basic fallback")
+        return ask_gemini_basic(query)
         
     except Exception as e:
         logger.error(f"❌ Smart Gemini error: {e}")
         return f"AI error: {str(e)[:80]}"
 
-# ================= OTHER TOOLS =================
+def ask_gemini_basic(query):
+    """Basic fallback if smart selection fails."""
+    # Try the most reliable free models
+    fallback_models = ["gemini-1.5-flash", "gemini-2.0-flash"]
+    
+    for model in fallback_models:
+        result, status = call_gemini_api(query, model, 500, 10)
+        if status == "SUCCESS" and result:
+            return f"[Fallback - {model}] {result}"
+    
+    return "Gemini AI is currently unavailable. Please try again in a moment."
+
+# ================= OTHER TOOLS (OPTIMIZED) - UNCHANGED =================
 def google_search(query, max_results=10):
-    """Google Search."""
+    """Google Search - EXACTLY AS YOU HAD IT."""
     try:
         if not GOOGLE_API_KEY or not CSE_ID:
             return "Google Search not configured."
@@ -365,10 +345,10 @@ def google_search(query, max_results=10):
         return "Google search error."
 
 def wikipedia_search(query, max_results=3):
-    """Wikipedia Search."""
+    """Wikipedia Search - EXACTLY AS YOU HAD IT."""
     try:
         url = "https://en.wikipedia.org/w/api.php"
-        headers = {'User-Agent': 'XiaozhiBot/3.7'}
+        headers = {'User-Agent': 'XiaozhiBot/3.6'}
         
         search_params = {
             "action": "query",
@@ -433,7 +413,7 @@ def wikipedia_search(query, max_results=3):
         logger.error(f"Wikipedia error: {e}")
         return "Wikipedia search error."
 
-# ================= MCP PROTOCOL HANDLER =================
+# ================= MCP PROTOCOL HANDLER (UNCHANGED) =================
 class MCPProtocolHandler:
     @staticmethod
     def handle_initialize(message_id):
@@ -444,8 +424,8 @@ class MCPProtocolHandler:
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {
-                    "name": "gemini-2026-thinking",
-                    "version": "3.7.0"
+                    "name": "smart-tier-gemini",
+                    "version": "3.6.0"
                 }
             }
         }
@@ -481,7 +461,7 @@ class MCPProtocolHandler:
                     },
                     {
                         "name": "ask_ai",
-                        "description": "Ask Gemini 3 Flash with 2026 thinking system (Auto-classifies and uses optimal thinking levels)",
+                        "description": "Ask AI with SMART tiered model selection (Auto-chooses Pro/Flash/Flash-Lite)",
                         "inputSchema": {
                             "type": "object",
                             "properties": {
@@ -538,28 +518,9 @@ class MCPProtocolHandler:
                 "error": {"code": -32000, "message": f"Error: {str(e)[:80]}"}
             }
 
-# ================= WEB SERVER =================
+# ================= WEB SERVER (UNCHANGED) =================
 app = Flask(__name__)
 server_start_time = time.time()
-
-# Test queries
-test_queries = [
-    "Explain why 1/0 is undefined using step-by-step reasoning",
-    "What is the capital of France?",
-    "Write a Python function to calculate Fibonacci sequence",
-    "What time is it?",
-    "Compare and contrast machine learning and deep learning",
-    "How to make a cup of tea",
-    "Calculate 15 * 27",
-    "What are the benefits of regular exercise?",
-    "Debug this code: for i in range(10): print(i",
-    "Tell me a joke",
-    "Analyze the economic impact of climate change in 2026",
-    "What is photosynthesis?",
-    "Write a detailed business plan for a startup",
-    "How does a quantum computer work?",
-    "Explain the theory of relativity to a 10-year-old"
-]
 
 @app.route('/')
 def index():
@@ -567,419 +528,77 @@ def index():
     hours, remainder = divmod(uptime, 3600)
     minutes, seconds = divmod(remainder, 60)
     
-    # Thinking levels info
-    thinking_levels = {
-        "high": "Maximum reasoning depth for complex problems",
-        "medium": "Balanced reasoning (default)",
-        "low": "Optimized for simple instructions", 
-        "minimal": "Basic tasks, lowest latency"
-    }
-    
-    # Generate test buttons HTML
-    test_buttons_html = ""
-    for i, query in enumerate(test_queries):
-        test_buttons_html += f'''
-        <div class="test-query">
-            <button onclick="testQuery('{query.replace("'", "\\'")}')">
-                🧪 {query[:45]}{'...' if len(query) > 45 else ''}
-            </button>
-            <div id="result-{i}" class="result"></div>
-        </div>
-        '''
-    
-    return render_template_string('''
+    return f"""
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Xiaozhi MCP v3.7 - Gemini 2026 Thinking System</title>
+        <title>Xiaozhi MCP v3.6</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body { 
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
-                max-width: 1200px; 
-                margin: 0 auto; 
-                padding: 20px;
-                background: linear-gradient(135deg, #f0f4ff 0%, #e6f7ff 100%);
-                min-height: 100vh;
-            }
-            .header { 
-                background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%); 
-                color: white; 
-                padding: 2.5rem; 
-                border-radius: 16px; 
-                margin-bottom: 2.5rem;
-                box-shadow: 0 8px 32px rgba(59, 130, 246, 0.3);
-            }
-            .thinking-levels {
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                gap: 1.5rem;
-                margin: 2rem 0;
-            }
-            .level-card {
-                background: white;
-                padding: 1.5rem;
-                border-radius: 12px;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.08);
-                border-top: 4px solid;
-                transition: transform 0.3s;
-            }
-            .level-card:hover {
-                transform: translateY(-4px);
-            }
-            .level-high { border-color: #ef4444; }
-            .level-medium { border-color: #f59e0b; }
-            .level-low { border-color: #10b981; }
-            .level-minimal { border-color: #3b82f6; }
-            .test-section {
-                background: white;
-                padding: 2rem;
-                border-radius: 16px;
-                margin: 2rem 0;
-                box-shadow: 0 4px 20px rgba(0,0,0,0.08);
-            }
-            .test-grid {
-                display: grid;
-                grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-                gap: 1rem;
-                margin-top: 1.5rem;
-            }
-            .test-query {
-                background: #f8fafc;
-                padding: 1rem;
-                border-radius: 10px;
-                border: 2px solid #e2e8f0;
-                transition: all 0.3s;
-            }
-            .test-query:hover {
-                border-color: #3b82f6;
-                background: #eff6ff;
-            }
-            button {
-                background: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
-                color: white;
-                border: none;
-                padding: 12px 20px;
-                border-radius: 8px;
-                cursor: pointer;
-                font-size: 15px;
-                font-weight: 500;
-                transition: all 0.3s;
-                width: 100%;
-                text-align: left;
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }
-            button:hover {
-                transform: translateY(-2px);
-                box-shadow: 0 6px 20px rgba(59, 130, 246, 0.4);
-            }
-            .result {
-                margin-top: 1rem;
-                padding: 1rem;
-                background: white;
-                border-radius: 8px;
-                border: 1px solid #e2e8f0;
-                display: none;
-                white-space: pre-wrap;
-                font-family: 'SF Mono', Monaco, monospace;
-                font-size: 13px;
-                max-height: 400px;
-                overflow-y: auto;
-                line-height: 1.5;
-            }
-            .thought-process {
-                background: #fef3c7;
-                border-left: 4px solid #f59e0b;
-                padding: 0.75rem;
-                margin: 0.5rem 0;
-                border-radius: 6px;
-                font-family: 'SF Mono', Monaco, monospace;
-                font-size: 12px;
-            }
-            .status-bar {
-                background: white;
-                padding: 1rem;
-                border-radius: 10px;
-                margin: 1rem 0;
-                display: flex;
-                justify-content: space-between;
-                align-items: center;
-                flex-wrap: wrap;
-                gap: 1rem;
-                box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-            }
-            .status-item {
-                display: flex;
-                align-items: center;
-                gap: 8px;
-            }
-            .sdk-status {
-                padding: 6px 12px;
-                border-radius: 20px;
-                font-size: 14px;
-                font-weight: 500;
-            }
-            .sdk-ok { background: #d1fae5; color: #065f46; }
-            .sdk-fail { background: #fee2e2; color: #991b1b; }
-            .custom-test {
-                background: #f0f9ff;
-                padding: 1.5rem;
-                border-radius: 12px;
-                margin-top: 2rem;
-                border: 2px dashed #93c5fd;
-            }
-            input[type="text"] {
-                width: 100%;
-                padding: 12px;
-                border: 2px solid #93c5fd;
-                border-radius: 8px;
-                font-size: 16px;
-                margin: 10px 0;
-                box-sizing: border-box;
-            }
-            .system-info {
-                background: #f8fafc;
-                padding: 1rem;
-                border-radius: 10px;
-                margin: 1rem 0;
-                border-left: 4px solid #8b5cf6;
-            }
+            body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
+            .header {{ background: linear-gradient(135deg, #4285F4 0%, #34A853 100%); 
+                      color: white; padding: 2rem; border-radius: 10px; margin-bottom: 2rem; }}
+            .tier {{ padding: 1rem; margin: 1rem 0; border-radius: 8px; }}
+            .hard {{ background: #FFEBEE; border-left: 4px solid #F44336; }}
+            .medium {{ background: #FFF3E0; border-left: 4px solid #FF9800; }}
+            .simple {{ background: #E8F5E9; border-left: 4px solid #4CAF50; }}
         </style>
     </head>
     <body>
         <div class="header">
-            <h1>🚀 Xiaozhi MCP v3.7</h1>
-            <p>Gemini 3 Flash 2026 Official Thinking System</p>
+            <h1>🚀 Xiaozhi MCP v3.6</h1>
+            <p>SMART Tiered Gemini Selection</p>
         </div>
         
-        <div class="status-bar">
-            <div class="status-item">
-                <strong>Uptime:</strong> {{hours}}h {{minutes}}m {{seconds}}s
-            </div>
-            <div class="status-item">
-                <strong>Cache:</strong> {{cache_size}} items
-            </div>
-            <div class="status-item">
-                <strong>SDK:</strong> 
-                <span class="sdk-status {{ 'sdk-ok' if sdk_available else 'sdk-fail' }}">
-                    {{ '✅ Available' if sdk_available else '❌ Not Available' }}
-                </span>
-            </div>
-            <div class="status-item">
-                <strong>API Key:</strong> 
-                <span class="sdk-status {{ 'sdk-ok' if api_key_available else 'sdk-fail' }}">
-                    {{ '✅ Configured' if api_key_available else '❌ Missing' }}
-                </span>
-            </div>
+        <h2>🎯 Your Model Tiers:</h2>
+        
+        <div class="tier hard">
+            <h3>🔴 HARD Tasks → Pro Tier</h3>
+            <p><strong>Models:</strong> gemini-2.5-pro → gemini-2.5-flash → gemini-2.5-flash-lite</p>
+            <p><strong>For:</strong> Complex analysis, coding, detailed explanations</p>
         </div>
         
-        <div class="system-info">
-            <h3>📚 About Temperature:</h3>
-            <p><strong>Temperature</strong> controls the randomness/creativity of responses:</p>
-            <ul>
-                <li><strong>Low (0.1-0.3):</strong> Focused, deterministic, consistent answers</li>
-                <li><strong>Medium (0.5-0.7):</strong> Balanced creativity and consistency</li>
-                <li><strong>High (0.8-1.0):</strong> Creative, diverse, less predictable</li>
-            </ul>
-            <p>In 2026, Gemini 3 Flash combines <strong>thinking_level</strong> (reasoning depth) with <strong>temperature</strong> (creativity control) for optimal responses.</p>
+        <div class="tier medium">
+            <h3>🟡 MEDIUM Tasks → Flash Tier</h3>
+            <p><strong>Models:</strong> gemini-2.5-flash → gemini-2.5-flash-lite → gemini-2.0-flash</p>
+            <p><strong>For:</strong> General Q&A, explanations, guides</p>
         </div>
         
-        <h2>🤔 Gemini 2026 Thinking Levels:</h2>
-        
-        <div class="thinking-levels">
-            <div class="level-card level-high">
-                <h3>🔴 HIGH Thinking</h3>
-                <p><strong>For:</strong> Complex analysis, coding, detailed reasoning</p>
-                <p><strong>Includes:</strong> Internal thoughts (reasoning process)</p>
-                <p><strong>Temperature:</strong> 0.2 (focused)</p>
-            </div>
-            
-            <div class="level-card level-medium">
-                <h3>🟡 MEDIUM Thinking</h3>
-                <p><strong>For:</strong> General Q&A, explanations, guides</p>
-                <p><strong>Default:</strong> Balanced reasoning</p>
-                <p><strong>Temperature:</strong> 0.7 (balanced)</p>
-            </div>
-            
-            <div class="level-card level-low">
-                <h3>🟢 LOW Thinking</h3>
-                <p><strong>For:</strong> Simple instructions, quick answers</p>
-                <p><strong>Optimized:</strong> For speed and efficiency</p>
-                <p><strong>Temperature:</strong> 0.9 (creative)</p>
-            </div>
-            
-            <div class="level-card level-minimal">
-                <h3>🔵 MINIMAL Thinking</h3>
-                <p><strong>For:</strong> Basic tasks, lowest latency</p>
-                <p><strong>Fastest:</strong> Response time</p>
-                <p><strong>Temperature:</strong> 0.9 (creative)</p>
-            </div>
+        <div class="tier simple">
+            <h3>🟢 SIMPLE Tasks → Flash-Lite Tier</h3>
+            <p><strong>Models:</strong> gemini-2.5-flash-lite</p>
+            <p><strong>For:</strong> Quick answers, facts, simple questions</p>
         </div>
         
-        <div class="test-section">
-            <h2>🧪 Test Thinking System</h2>
-            <p>Click any query to test how Gemini classifies and applies thinking levels:</p>
-            
-            <div class="test-grid">
-                ''' + test_buttons_html + '''
-            </div>
-            
-            <div class="custom-test">
-                <h3>Custom Test Query:</h3>
-                <input type="text" id="custom-query" placeholder="Enter your own query to test thinking levels...">
-                <button onclick="testCustomQuery()" style="background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);">
-                    🔬 Test Custom Query
-                </button>
-                <div id="custom-result" class="result"></div>
-            </div>
-        </div>
-        
-        <script>
-            function testQuery(query) {
-                const button = event.target;
-                const resultDiv = button.parentElement.querySelector('.result');
-                
-                // Show loading
-                resultDiv.innerHTML = '<div style="color: #f59e0b; font-weight: 600;">⏳ Gemini is classifying and applying thinking level...</div>';
-                resultDiv.style.display = 'block';
-                
-                // Call test endpoint
-                fetch('/test-smart/' + encodeURIComponent(query))
-                    .then(response => response.json())
-                    .then(data => {
-                        let result = data.result;
-                        
-                        // Format thoughts if present
-                        if (result.includes('🤔 **Internal Reasoning:**')) {
-                            const parts = result.split('🤔 **Internal Reasoning:**');
-                            const thoughts = parts[1]?.split('💡 **Final Answer:**')[0];
-                            const answer = parts[1]?.split('💡 **Final Answer:**')[1] || parts[1];
-                            
-                            resultDiv.innerHTML = `
-                                <div style="color: #10b981; font-weight: 600; margin-bottom: 10px;">
-                                    ✅ Thinking Level Applied
-                                </div>
-                                <hr style="margin: 10px 0; border: 1px solid #e2e8f0;">
-                                <strong>Query:</strong> ${data.query}<br><br>
-                                <strong>Thought Process:</strong>
-                                <div class="thought-process">${thoughts || 'No thoughts captured'}</div>
-                                <strong>Final Answer:</strong><br>${(answer || result).replace(/\n/g, '<br>')}
-                            `;
-                        } else {
-                            resultDiv.innerHTML = `
-                                <div style="color: #10b981; font-weight: 600; margin-bottom: 10px;">
-                                    ✅ Thinking Level Applied
-                                </div>
-                                <hr style="margin: 10px 0; border: 1px solid #e2e8f0;">
-                                <strong>Query:</strong> ${data.query}<br><br>
-                                <strong>Result:</strong><br>${result.replace(/\n/g, '<br>')}
-                            `;
-                        }
-                    })
-                    .catch(error => {
-                        resultDiv.innerHTML = `<div style="color: #ef4444; font-weight: 600;">❌ Error: ${error}</div>`;
-                    });
-            }
-            
-            function testCustomQuery() {
-                const query = document.getElementById('custom-query').value;
-                if (!query) {
-                    alert('Please enter a query');
-                    return;
-                }
-                
-                const resultDiv = document.getElementById('custom-result');
-                resultDiv.innerHTML = '<div style="color: #f59e0b; font-weight: 600;">⏳ Gemini is classifying and applying thinking level...</div>';
-                resultDiv.style.display = 'block';
-                
-                fetch('/test-smart/' + encodeURIComponent(query))
-                    .then(response => response.json())
-                    .then(data => {
-                        let result = data.result;
-                        
-                        if (result.includes('🤔 **Internal Reasoning:**')) {
-                            const parts = result.split('🤔 **Internal Reasoning:**');
-                            const thoughts = parts[1]?.split('💡 **Final Answer:**')[0];
-                            const answer = parts[1]?.split('💡 **Final Answer:**')[1] || parts[1];
-                            
-                            resultDiv.innerHTML = `
-                                <div style="color: #10b981; font-weight: 600; margin-bottom: 10px;">
-                                    ✅ Thinking Level Applied
-                                </div>
-                                <hr style="margin: 10px 0; border: 1px solid #e2e8f0;">
-                                <strong>Query:</strong> ${data.query}<br><br>
-                                <strong>Thought Process:</strong>
-                                <div class="thought-process">${thoughts || 'No thoughts captured'}</div>
-                                <strong>Final Answer:</strong><br>${(answer || result).replace(/\n/g, '<br>')}
-                            `;
-                        } else {
-                            resultDiv.innerHTML = `
-                                <div style="color: #10b981; font-weight: 600; margin-bottom: 10px;">
-                                    ✅ Thinking Level Applied
-                                </div>
-                                <hr style="margin: 10px 0; border: 1px solid #e2e8f0;">
-                                <strong>Query:</strong> ${data.query}<br><br>
-                                <strong>Result:</strong><br>${result.replace(/\n/g, '<br>')}
-                            `;
-                        }
-                    })
-                    .catch(error => {
-                        resultDiv.innerHTML = `<div style="color: #ef4444; font-weight: 600;">❌ Error: ${error}</div>`;
-                    });
-            }
-            
-            // Auto-refresh status every 30 seconds
-            setInterval(() => {
-                fetch('/health')
-                    .then(response => response.json())
-                    .then(data => {
-                        console.log('Health check:', data.status);
-                    })
-                    .catch(() => {
-                        console.warn('Health check failed');
-                    });
-            }, 30000);
-        </script>
+        <p>Uptime: {hours}h {minutes}m {seconds}s | Cache: {len(gemini_cache)} items</p>
     </body>
     </html>
-    ''', 
-    hours=hours, 
-    minutes=minutes, 
-    seconds=seconds,
-    cache_size=len(gemini_cache),
-    sdk_available=GEMINI_SDK_AVAILABLE and bool(GOOGLE_API_KEY),
-    api_key_available=bool(GOOGLE_API_KEY))
+    """
 
 @app.route('/health')
 def health_check():
     return jsonify({
         "status": "healthy",
-        "version": "3.7.0",
-        "gemini_sdk": GEMINI_SDK_AVAILABLE,
-        "api_key_configured": bool(GOOGLE_API_KEY),
-        "cache_size": len(gemini_cache),
-        "thinking_system": "Gemini 3 Flash 2026",
-        "supported_levels": ["minimal", "low", "medium", "high"]
+        "version": "3.6.0",
+        "tiers": SmartModelSelector.TIERS,
+        "cache_size": len(gemini_cache)
     }), 200
 
-@app.route('/test-smart/<path:query>')
+@app.route('/test-smart/<query>')
 def test_smart(query):
-    """Test the smart tier selection with thinking system."""
+    """Test the smart tier selection."""
     result = ask_gemini_smart(query)
     return jsonify({
         "query": query,
         "result": result,
-        "cache_size": len(gemini_cache),
-        "timestamp": datetime.now().isoformat()
+        "cache_size": len(gemini_cache)
     }), 200
 
 def run_web_server():
     app.run(host='0.0.0.0', port=3000, debug=False, threaded=True)
 
-# ================= MAIN =================
+# ================= MAIN (UNCHANGED) =================
 async def mcp_bridge():
     """WebSocket bridge."""
     reconnect_delay = 2
@@ -1033,18 +652,13 @@ async def mcp_bridge():
             reconnect_delay = min(reconnect_delay * 1.5, 60)
 
 async def main():
-    logger.info("🚀 Starting Xiaozhi MCP v3.7 - Gemini 2026 Thinking System")
-    logger.info(f"📊 Google Gen AI SDK: {'✅ Available' if GEMINI_SDK_AVAILABLE else '❌ Not available'}")
-    logger.info(f"🔑 API Key: {'✅ Configured' if GOOGLE_API_KEY else '❌ Missing'}")
-    
-    if not GEMINI_SDK_AVAILABLE:
-        logger.warning("⚠️ Install Google Gen AI SDK: pip install google-generativeai")
+    logger.info("🚀 Starting Xiaozhi MCP v3.6 - Smart Tiered Gemini")
+    logger.info(f"📊 Gemini: {'✅ Configured' if GEMINI_API_KEY else '❌ Not configured'}")
     
     # Start web server
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
     logger.info("🌐 Web server on http://0.0.0.0:3000")
-    logger.info("🧪 Test interface available at http://0.0.0.0:3000")
     
     # Start MCP bridge
     await mcp_bridge()
