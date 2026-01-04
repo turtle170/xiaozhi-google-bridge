@@ -1,4 +1,4 @@
-# main.py - XIAOZHI MCP SERVER v3.6.1 - ASYNC PING FIX
+# main.py - XIAOZHI MCP SERVER v3.6.1 - ASYNC PING FIX (IMPORT FIXED)
 import os
 import asyncio
 import json
@@ -13,9 +13,9 @@ from dotenv import load_dotenv
 import re
 import hashlib
 from datetime import datetime, timedelta
-import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
-from typing import Dict, Set
+from typing import Dict
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 load_dotenv()
@@ -55,6 +55,7 @@ gemini_cache = {}
 CACHE_DURATION = 300
 active_requests: Dict[str, bool] = {}
 ping_tasks: Dict[str, asyncio.Task] = {}
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)  # FIXED: Properly defined
 
 keep_alive_messages = [
     "AI is thinking... 🧠",
@@ -366,12 +367,12 @@ class AsyncGeminiProcessor:
             max_tokens = config["tokens"]
             timeouts = config["timeouts"][:PARALLEL_MODEL_TRIES]
             
-            # Submit models in parallel
+            # Submit models in parallel using ThreadPoolExecutor
             futures = []
-            with ThreadPoolExecutor(max_workers=PARALLEL_MODEL_TRIES) as executor:
+            with ThreadPoolExecutor(max_workers=PARALLEL_MODEL_TRIES) as model_executor:
                 for i, model in enumerate(models):
                     timeout = timeouts[i] if i < len(timeouts) else 10
-                    future = executor.submit(
+                    future = model_executor.submit(
                         AsyncGeminiProcessor.call_gemini_sync,
                         query, model, max_tokens, timeout
                     )
@@ -385,10 +386,8 @@ class AsyncGeminiProcessor:
                             logger.info(f"✅ {model} succeeded!")
                             gemini_cache[cache_key] = (datetime.now(), result)
                             return f"[{tier} - {model}] {result}"
-                    except concurrent.futures.TimeoutError:
-                        logger.warning(f"⏰ {model} future timeout")
                     except Exception as e:
-                        logger.error(f"❌ {model} error: {e}")
+                        logger.warning(f"⚠️ {model} failed: {e}")
             
             # Fallback sequential
             logger.warning("⚠️ Parallel failed, trying sequential")
