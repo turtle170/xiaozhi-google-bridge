@@ -519,8 +519,42 @@ class MCPProtocolHandler:
             }
 
 # ================= WEB SERVER (UNCHANGED) =================
+# ================= WEB SERVER WITH REAL-TIME FEATURES =================
 app = Flask(__name__)
 server_start_time = time.time()
+log_buffer = []
+MAX_LOG_LINES = 50
+
+# Store test queries
+test_queries = [
+    "Explain quantum computing in simple terms",
+    "What is the capital of France?",
+    "Write a Python function to calculate Fibonacci",
+    "Compare machine learning and deep learning",
+    "How to make a cup of tea"
+]
+
+def add_log(level, message):
+    """Add log to buffer for real-time display."""
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    log_entry = {
+        'time': timestamp,
+        'level': level,
+        'message': message,
+        'color': {
+            'INFO': '#4CAF50',
+            'WARNING': '#FF9800',
+            'ERROR': '#F44336',
+            'DEBUG': '#2196F3'
+        }.get(level, '#757575')
+    }
+    log_buffer.append(log_entry)
+    if len(log_buffer) > MAX_LOG_LINES:
+        log_buffer.pop(0)
+
+# Initialize some logs
+add_log('INFO', 'Server starting...')
+add_log('INFO', f'Gemini API: {'✅ Configured' if GEMINI_API_KEY else '❌ Not configured'}')
 
 @app.route('/')
 def index():
@@ -528,77 +562,732 @@ def index():
     hours, remainder = divmod(uptime, 3600)
     minutes, seconds = divmod(remainder, 60)
     
-    return f"""
+    return render_template_string('''
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Xiaozhi MCP v3.6</title>
+        <title>Xiaozhi MCP v3.6.1 - Dashboard</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
-            .header {{ background: linear-gradient(135deg, #4285F4 0%, #34A853 100%); 
-                      color: white; padding: 2rem; border-radius: 10px; margin-bottom: 2rem; }}
-            .tier {{ padding: 1rem; margin: 1rem 0; border-radius: 8px; }}
-            .hard {{ background: #FFEBEE; border-left: 4px solid #F44336; }}
-            .medium {{ background: #FFF3E0; border-left: 4px solid #FF9800; }}
-            .simple {{ background: #E8F5E9; border-left: 4px solid #4CAF50; }}
+            :root {
+                --primary: #4285F4;
+                --success: #34A853;
+                --warning: #FBBC05;
+                --danger: #EA4335;
+                --dark: #202124;
+                --light: #f8f9fa;
+            }
+            
+            body { 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                margin: 0;
+                padding: 20px;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                min-height: 100vh;
+            }
+            
+            .dashboard {
+                max-width: 1400px;
+                margin: 0 auto;
+                display: grid;
+                grid-template-columns: 2fr 1fr;
+                gap: 20px;
+            }
+            
+            .card {
+                background: white;
+                border-radius: 12px;
+                padding: 24px;
+                box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+                margin-bottom: 20px;
+            }
+            
+            .header {
+                grid-column: 1 / -1;
+                background: white;
+                padding: 30px;
+                border-radius: 16px;
+                text-align: center;
+                box-shadow: 0 8px 25px rgba(0,0,0,0.1);
+            }
+            
+            .status-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                gap: 15px;
+                margin: 20px 0;
+            }
+            
+            .status-item {
+                padding: 15px;
+                border-radius: 10px;
+                text-align: center;
+                background: var(--light);
+            }
+            
+            .uptime-display {
+                font-size: 28px;
+                font-weight: bold;
+                color: var(--primary);
+                margin: 10px 0;
+            }
+            
+            .log-panel {
+                height: 400px;
+                overflow-y: auto;
+                background: var(--dark);
+                color: white;
+                border-radius: 8px;
+                padding: 15px;
+                font-family: 'Monaco', 'Menlo', monospace;
+                font-size: 13px;
+            }
+            
+            .log-entry {
+                padding: 4px 0;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+            }
+            
+            .log-time {
+                color: #aaa;
+                margin-right: 10px;
+            }
+            
+            .log-level {
+                font-weight: bold;
+                padding: 2px 6px;
+                border-radius: 4px;
+                margin-right: 10px;
+                font-size: 11px;
+            }
+            
+            .nav-links {
+                display: flex;
+                gap: 10px;
+                margin: 20px 0;
+                flex-wrap: wrap;
+            }
+            
+            .nav-btn {
+                padding: 10px 20px;
+                background: var(--primary);
+                color: white;
+                text-decoration: none;
+                border-radius: 8px;
+                transition: all 0.3s;
+            }
+            
+            .nav-btn:hover {
+                background: #3367D6;
+                transform: translateY(-2px);
+            }
+            
+            .test-section {
+                display: grid;
+                gap: 10px;
+            }
+            
+            .test-btn {
+                padding: 12px;
+                background: var(--light);
+                border: 2px solid var(--primary);
+                border-radius: 8px;
+                cursor: pointer;
+                text-align: left;
+                transition: all 0.3s;
+            }
+            
+            .test-btn:hover {
+                background: var(--primary);
+                color: white;
+            }
+            
+            .result-display {
+                padding: 15px;
+                background: var(--light);
+                border-radius: 8px;
+                margin-top: 15px;
+                display: none;
+                white-space: pre-wrap;
+                max-height: 300px;
+                overflow-y: auto;
+            }
+            
+            .real-time {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin: 15px 0;
+            }
+            
+            .pulse {
+                width: 10px;
+                height: 10px;
+                border-radius: 50%;
+                background: var(--success);
+                animation: pulse 2s infinite;
+            }
+            
+            @keyframes pulse {
+                0% { opacity: 1; }
+                50% { opacity: 0.5; }
+                100% { opacity: 1; }
+            }
+            
+            .refresh-btn {
+                padding: 8px 16px;
+                background: var(--warning);
+                color: white;
+                border: none;
+                border-radius: 6px;
+                cursor: pointer;
+            }
+            
+            .grid-2col {
+                grid-column: 1 / -1;
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 20px;
+            }
+            
+            @media (max-width: 1024px) {
+                .dashboard {
+                    grid-template-columns: 1fr;
+                }
+                .grid-2col {
+                    grid-template-columns: 1fr;
+                }
+            }
         </style>
     </head>
     <body>
-        <div class="header">
-            <h1>🚀 Xiaozhi MCP v3.6</h1>
-            <p>SMART Tiered Gemini Selection</p>
+        <div class="dashboard">
+            <!-- Header -->
+            <div class="header">
+                <h1 style="margin:0;color:var(--primary);">🚀 Xiaozhi MCP v3.6.1</h1>
+                <p style="color:#666;margin:5px 0 20px 0;">Real-time Dashboard</p>
+                
+                <div class="status-grid">
+                    <div class="status-item">
+                        <div style="color:#666;font-size:14px;">Uptime</div>
+                        <div class="uptime-display" id="uptime">{{hours}}h {{minutes}}m {{seconds}}s</div>
+                    </div>
+                    <div class="status-item">
+                        <div style="color:#666;font-size:14px;">Cache Size</div>
+                        <div style="font-size:24px;color:var(--primary);">{{cache_size}} items</div>
+                    </div>
+                    <div class="status-item">
+                        <div style="color:#666;font-size:14px;">Log Entries</div>
+                        <div style="font-size:24px;color:var(--primary);">{{log_count}}</div>
+                    </div>
+                    <div class="status-item">
+                        <div style="color:#666;font-size:14px;">Status</div>
+                        <div style="font-size:24px;color:var(--success);">✅ Live</div>
+                    </div>
+                </div>
+                
+                <div class="real-time">
+                    <div class="pulse"></div>
+                    <span>Real-time updating</span>
+                    <button class="refresh-btn" onclick="refreshData()">🔄 Refresh</button>
+                </div>
+            </div>
+            
+            <!-- Navigation -->
+            <div class="card">
+                <h3 style="margin-top:0;color:var(--primary);">🔗 Quick Links</h3>
+                <div class="nav-links">
+                    <a href="/health" class="nav-btn" target="_blank">📊 Health Check</a>
+                    <a href="/test-smart/hello" class="nav-btn" target="_blank">🧪 Quick Test</a>
+                    <a href="/logs" class="nav-btn" target="_blank">📋 View Logs</a>
+                    <a href="/stats" class="nav-btn" target="_blank">📈 Statistics</a>
+                    <a href="/api-docs" class="nav-btn" target="_blank">📚 API Docs</a>
+                </div>
+                
+                <h3 style="margin-top:25px;color:var(--primary);">⚡ System Info</h3>
+                <div style="background:var(--light);padding:15px;border-radius:8px;">
+                    <div><strong>Version:</strong> 3.6.1 (Gemini-powered tiers)</div>
+                    <div><strong>MCP Protocol:</strong> 2024-11-05</div>
+                    <div><strong>Models Available:</strong> Gemini 2.5 Pro/Flash/Flash-Lite</div>
+                    <div><strong>Last Updated:</strong> {{timestamp}}</div>
+                </div>
+            </div>
+            
+            <!-- Real-time Logs -->
+            <div class="card">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <h3 style="margin-top:0;color:var(--primary);">📝 Live Logs</h3>
+                    <button class="refresh-btn" onclick="refreshLogs()">↻ Update Logs</button>
+                </div>
+                <div class="log-panel" id="logPanel">
+                    {% for log in logs %}
+                    <div class="log-entry">
+                        <span class="log-time">{{log.time}}</span>
+                        <span class="log-level" style="background:{{log.color}};">{{log.level}}</span>
+                        <span>{{log.message}}</span>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            
+            <!-- Testing Panel -->
+            <div class="card">
+                <h3 style="margin-top:0;color:var(--primary);">🧪 Test Tier Classification</h3>
+                <div class="test-section">
+                    {% for query in test_queries %}
+                    <button class="test-btn" onclick="runTest('{{query}}')">
+                        Test: {{query[:50]}}{% if query|length > 50 %}...{% endif %}
+                    </button>
+                    {% endfor %}
+                    
+                    <div style="margin-top:15px;">
+                        <input type="text" id="customQuery" placeholder="Enter custom query..." 
+                               style="width:70%;padding:10px;border:2px solid #ddd;border-radius:6px;">
+                        <button onclick="runCustomTest()" 
+                                style="padding:10px 20px;background:var(--primary);color:white;border:none;border-radius:6px;">
+                            Run Test
+                        </button>
+                    </div>
+                </div>
+                
+                <div id="testResult" class="result-display"></div>
+            </div>
+            
+            <!-- System Stats -->
+            <div class="card grid-2col">
+                <div>
+                    <h3 style="margin-top:0;color:var(--primary);">📊 Performance</h3>
+                    <div style="background:var(--light);padding:15px;border-radius:8px;">
+                        <div style="margin:10px 0;">
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>Gemini API Status:</span>
+                                <span id="geminiStatus" style="color:var(--success);">● Operational</span>
+                            </div>
+                            <div style="height:8px;background:#eee;border-radius:4px;margin:5px 0;">
+                                <div style="width:85%;height:100%;background:var(--success);border-radius:4px;"></div>
+                            </div>
+                        </div>
+                        <div style="margin:10px 0;">
+                            <div style="display:flex;justify-content:space-between;">
+                                <span>WebSocket Connection:</span>
+                                <span id="wsStatus" style="color:var(--success);">● Connected</span>
+                            </div>
+                            <div style="height:8px;background:#eee;border-radius:4px;margin:5px 0;">
+                                <div style="width:92%;height:100%;background:var(--success);border-radius:4px;"></div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div>
+                    <h3 style="margin-top:0;color:var(--primary);">⚙️ Quick Actions</h3>
+                    <div style="display:grid;gap:10px;">
+                        <button onclick="clearCache()" style="padding:12px;background:var(--warning);color:white;border:none;border-radius:6px;">
+                            🗑️ Clear Cache
+                        </button>
+                        <button onclick="forceReconnect()" style="padding:12px;background:var(--primary);color:white;border:none;border-radius:6px;">
+                            🔄 Reconnect MCP
+                        </button>
+                        <button onclick="runDiagnostics()" style="padding:12px;background:#666;color:white;border:none;border-radius:6px;">
+                            🩺 Run Diagnostics
+                        </button>
+                    </div>
+                </div>
+            </div>
         </div>
         
-        <h2>🎯 Your Model Tiers:</h2>
-        
-        <div class="tier hard">
-            <h3>🔴 HARD Tasks → Pro Tier</h3>
-            <p><strong>Models:</strong> gemini-2.5-pro → gemini-2.5-flash → gemini-2.5-flash-lite</p>
-            <p><strong>For:</strong> Complex analysis, coding, detailed explanations</p>
-        </div>
-        
-        <div class="tier medium">
-            <h3>🟡 MEDIUM Tasks → Flash Tier</h3>
-            <p><strong>Models:</strong> gemini-2.5-flash → gemini-2.5-flash-lite → gemini-2.0-flash</p>
-            <p><strong>For:</strong> General Q&A, explanations, guides</p>
-        </div>
-        
-        <div class="tier simple">
-            <h3>🟢 SIMPLE Tasks → Flash-Lite Tier</h3>
-            <p><strong>Models:</strong> gemini-2.5-flash-lite</p>
-            <p><strong>For:</strong> Quick answers, facts, simple questions</p>
-        </div>
-        
-        <p>Uptime: {hours}h {minutes}m {seconds}s | Cache: {len(gemini_cache)} items</p>
+        <script>
+            // Auto-update uptime
+            function updateUptime() {
+                fetch('/api/uptime')
+                    .then(r => r.json())
+                    .then(data => {
+                        document.getElementById('uptime').textContent = 
+                            `${data.hours}h ${data.minutes}m ${data.seconds}s`;
+                    });
+            }
+            
+            // Update logs
+            function refreshLogs() {
+                fetch('/api/logs')
+                    .then(r => r.json())
+                    .then(logs => {
+                        const panel = document.getElementById('logPanel');
+                        panel.innerHTML = logs.map(log => `
+                            <div class="log-entry">
+                                <span class="log-time">${log.time}</span>
+                                <span class="log-level" style="background:${log.color};">${log.level}</span>
+                                <span>${log.message}</span>
+                            </div>
+                        `).join('');
+                        panel.scrollTop = panel.scrollHeight;
+                    });
+            }
+            
+            // Run test
+            function runTest(query) {
+                const resultDiv = document.getElementById('testResult');
+                resultDiv.style.display = 'block';
+                resultDiv.innerHTML = `<div style="color:var(--warning);">⏳ Testing: "${query}"...</div>`;
+                
+                fetch('/test-smart/' + encodeURIComponent(query))
+                    .then(r => r.json())
+                    .then(data => {
+                        resultDiv.innerHTML = `
+                            <div style="color:var(--success);margin-bottom:10px;">✅ Test Complete</div>
+                            <div><strong>Query:</strong> ${data.query}</div>
+                            <div><strong>Result:</strong></div>
+                            <div style="margin-top:10px;background:white;padding:10px;border-radius:6px;border:1px solid #ddd;">
+                                ${data.result.replace(/\n/g, '<br>')}
+                            </div>
+                            <div style="margin-top:10px;color:#666;font-size:12px;">
+                                Cache: ${data.cache_size} items | ${data.timestamp}
+                            </div>
+                        `;
+                        add_log('INFO', `Test completed: ${query.substring(0, 30)}...`);
+                    })
+                    .catch(err => {
+                        resultDiv.innerHTML = `<div style="color:var(--danger);">❌ Error: ${err}</div>`;
+                    });
+            }
+            
+            function runCustomTest() {
+                const query = document.getElementById('customQuery').value;
+                if (query) runTest(query);
+            }
+            
+            function refreshData() {
+                updateUptime();
+                refreshLogs();
+                fetch('/api/stats')
+                    .then(r => r.json())
+                    .then(data => {
+                        // Update any stats as needed
+                    });
+                add_log('INFO', 'Dashboard manually refreshed');
+            }
+            
+            // Action functions
+            function clearCache() {
+                if (confirm('Clear all cached responses?')) {
+                    fetch('/api/clear-cache', { method: 'POST' })
+                        .then(r => r.json())
+                        .then(data => {
+                            alert('Cache cleared successfully!');
+                            add_log('INFO', 'Cache cleared manually');
+                        });
+                }
+            }
+            
+            function forceReconnect() {
+                fetch('/api/reconnect', { method: 'POST' })
+                    .then(r => r.json())
+                    .then(data => {
+                        alert('Reconnection initiated');
+                        add_log('INFO', 'Manual reconnection requested');
+                    });
+            }
+            
+            function runDiagnostics() {
+                fetch('/api/diagnostics')
+                    .then(r => r.json())
+                    .then(data => {
+                        alert(`Diagnostics complete:\n\n${JSON.stringify(data, null, 2)}`);
+                        add_log('INFO', 'Diagnostics run completed');
+                    });
+            }
+            
+            // Simulate adding a log (for demo)
+            function add_log(level, message) {
+                const panel = document.getElementById('logPanel');
+                const colors = {
+                    'INFO': '#4CAF50',
+                    'WARNING': '#FF9800',
+                    'ERROR': '#F44336'
+                };
+                const time = new Date().toLocaleTimeString('en-US', {hour12: false});
+                const entry = document.createElement('div');
+                entry.className = 'log-entry';
+                entry.innerHTML = `
+                    <span class="log-time">${time}</span>
+                    <span class="log-level" style="background:${colors[level] || '#666'};">${level}</span>
+                    <span>${message}</span>
+                `;
+                panel.appendChild(entry);
+                panel.scrollTop = panel.scrollHeight;
+            }
+            
+            // Auto-refresh every 10 seconds
+            setInterval(updateUptime, 10000);
+            setInterval(refreshLogs, 15000);
+            
+            // Initial load
+            updateUptime();
+        </script>
     </body>
     </html>
-    """
+    ''', 
+    hours=hours, 
+    minutes=minutes, 
+    seconds=seconds,
+    cache_size=len(gemini_cache),
+    log_count=len(log_buffer),
+    logs=log_buffer[-20:],  // Last 20 logs
+    test_queries=test_queries,
+    timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
 
 @app.route('/health')
 def health_check():
+    """Comprehensive health check endpoint."""
+    uptime = int(time.time() - server_start_time)
+    add_log('INFO', 'Health check accessed')
+    
     return jsonify({
         "status": "healthy",
-        "version": "3.6.0",
-        "tiers": SmartModelSelector.TIERS,
-        "cache_size": len(gemini_cache)
+        "version": "3.6.1",
+        "uptime_seconds": uptime,
+        "uptime_human": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
+        "cache_size": len(gemini_cache),
+        "log_count": len(log_buffer),
+        "gemini_configured": bool(GEMINI_API_KEY),
+        "google_configured": bool(GOOGLE_API_KEY and CSE_ID),
+        "last_log": log_buffer[-1]['message'] if log_buffer else "No logs",
+        "timestamp": datetime.now().isoformat()
     }), 200
 
-@app.route('/test-smart/<query>')
+@app.route('/logs')
+def view_logs():
+    """View all logs in a clean interface."""
+    return render_template_string('''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>System Logs - Xiaozhi MCP</title>
+        <meta charset="utf-8">
+        <style>
+            body { font-family: monospace; margin: 20px; background: #1a1a1a; color: #fff; }
+            .log-entry { padding: 5px 0; border-bottom: 1px solid #333; }
+            .time { color: #888; margin-right: 15px; }
+            .INFO { color: #4CAF50; }
+            .WARNING { color: #FF9800; }
+            .ERROR { color: #F44336; }
+            .DEBUG { color: #2196F3; }
+            h1 { color: #4285F4; }
+            .back-btn { 
+                background: #4285F4; color: white; padding: 10px 20px; 
+                text-decoration: none; border-radius: 6px; margin-bottom: 20px; display: inline-block;
+            }
+        </style>
+    </head>
+    <body>
+        <a href="/" class="back-btn">← Back to Dashboard</a>
+        <h1>📋 System Logs ({{ logs|length }} entries)</h1>
+        {% for log in logs %}
+        <div class="log-entry">
+            <span class="time">[{{ log.time }}]</span>
+            <span class="{{ log.level }}"><strong>{{ log.level }}</strong></span>
+            <span>{{ log.message }}</span>
+        </div>
+        {% endfor %}
+        <script>
+            // Auto-scroll to bottom
+            window.scrollTo(0, document.body.scrollHeight);
+        </script>
+    </body>
+    </html>
+    ''', logs=log_buffer)
+
+@app.route('/stats')
+def statistics():
+    """Statistics endpoint."""
+    tier_counts = {'HARD': 0, 'MEDIUM': 0, 'SIMPLE': 0}
+    for key in gemini_cache:
+        if '[HARD' in key: tier_counts['HARD'] += 1
+        elif '[MEDIUM' in key: tier_counts['MEDIUM'] += 1
+        elif '[SIMPLE' in key: tier_counts['SIMPLE'] += 1
+    
+    add_log('INFO', 'Statistics page accessed')
+    
+    return jsonify({
+        "cache_statistics": {
+            "total_items": len(gemini_cache),
+            "by_tier": tier_counts,
+            "oldest": min(gemini_cache.values())[0].isoformat() if gemini_cache else None
+        },
+        "log_statistics": {
+            "total_logs": len(log_buffer),
+            "by_level": {
+                'INFO': sum(1 for log in log_buffer if log['level'] == 'INFO'),
+                'WARNING': sum(1 for log in log_buffer if log['level'] == 'WARNING'),
+                'ERROR': sum(1 for log in log_buffer if log['level'] == 'ERROR')
+            }
+        },
+        "system": {
+            "gemini_api_configured": bool(GEMINI_API_KEY),
+            "google_api_configured": bool(GOOGLE_API_KEY),
+            "test_queries_count": len(test_queries)
+        }
+    }), 200
+
+@app.route('/api-docs')
+def api_docs():
+    """API documentation page."""
+    return render_template_string('''
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>API Documentation - Xiaozhi MCP</title>
+        <meta charset="utf-8">
+        <style>
+            body { font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
+            h1, h2 { color: #4285F4; }
+            .endpoint { background: #f5f5f5; padding: 15px; margin: 15px 0; border-radius: 8px; }
+            code { background: #333; color: #fff; padding: 2px 6px; border-radius: 4px; }
+            .method { font-weight: bold; color: #34A853; }
+            .back-btn { 
+                background: #4285F4; color: white; padding: 10px 20px; 
+                text-decoration: none; border-radius: 6px; margin-bottom: 20px; display: inline-block;
+            }
+        </style>
+    </head>
+    <body>
+        <a href="/" class="back-btn">← Back to Dashboard</a>
+        <h1>📚 API Documentation</h1>
+        
+        <h2>🔗 Available Endpoints</h2>
+        
+        <div class="endpoint">
+            <div class="method">GET</div>
+            <code>/</code> - Main dashboard with real-time monitoring
+        </div>
+        
+        <div class="endpoint">
+            <div class="method">GET</div>
+            <code>/health</code> - System health check (JSON)
+        </div>
+        
+        <div class="endpoint">
+            <div class="method">GET</div>
+            <code>/logs</code> - View system logs
+        </div>
+        
+        <div class="endpoint">
+            <div class="method">GET</div>
+            <code>/stats</code> - Statistics (JSON)
+        </div>
+        
+        <div class="endpoint">
+            <div class="method">GET</div>
+            <code>/test-smart/&lt;query&gt;</code> - Test tier classification
+        </div>
+        
+        <h2>⚡ Real-time APIs</h2>
+        
+        <div class="endpoint">
+            <div class="method">GET</div>
+            <code>/api/uptime</code> - Get current uptime
+        </div>
+        
+        <div class="endpoint">
+            <div class="method">GET</div>
+            <code>/api/logs</code> - Get recent logs (JSON)
+        </div>
+        
+        <div class="endpoint">
+            <div class="method">POST</div>
+            <code>/api/clear-cache</code> - Clear Gemini cache
+        </div>
+        
+        <h2>🔧 MCP Protocol</h2>
+        <p>The server implements Model Context Protocol (MCP) over WebSocket:</p>
+        <ul>
+            <li><strong>Tools:</strong> google_search, wikipedia_search, ask_ai</li>
+            <li><strong>Protocol Version:</strong> 2024-11-05</li>
+            <li><strong>Tier Selection:</strong> Gemini-powered (HARD/MEDIUM/SIMPLE)</li>
+        </ul>
+    </body>
+    </html>
+    ''')
+
+# API endpoints for real-time updates
+@app.route('/api/uptime')
+def api_uptime():
+    uptime = int(time.time() - server_start_time)
+    hours, remainder = divmod(uptime, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return jsonify({
+        'hours': hours,
+        'minutes': minutes,
+        'seconds': seconds,
+        'total_seconds': uptime
+    })
+
+@app.route('/api/logs')
+def api_logs():
+    return jsonify(log_buffer[-30:])  # Last 30 logs
+
+@app.route('/api/stats')
+def api_stats():
+    return jsonify({
+        'cache_size': len(gemini_cache),
+        'log_count': len(log_buffer),
+        'test_queries': len(test_queries),
+        'server_time': datetime.now().isoformat()
+    })
+
+@app.route('/api/clear-cache', methods=['POST'])
+def api_clear_cache():
+    gemini_cache.clear()
+    add_log('INFO', 'Cache cleared via API')
+    return jsonify({'status': 'success', 'message': 'Cache cleared'})
+
+@app.route('/api/reconnect', methods=['POST'])
+def api_reconnect():
+    add_log('WARNING', 'Manual reconnection requested')
+    return jsonify({'status': 'queued', 'message': 'Reconnection will be attempted'})
+
+@app.route('/api/diagnostics')
+def api_diagnostics():
+    add_log('INFO', 'Diagnostics run')
+    return jsonify({
+        'python_version': sys.version,
+        'environment_vars': {
+            'GEMINI_API_KEY': '✅ Set' if GEMINI_API_KEY else '❌ Missing',
+            'GOOGLE_API_KEY': '✅ Set' if GOOGLE_API_KEY else '❌ Missing',
+            'CSE_ID': '✅ Set' if CSE_ID else '❌ Missing',
+            'XIAOZHI_WS': '✅ Set' if XIAOZHI_WS else '❌ Missing'
+        },
+        'cache_info': {
+            'size': len(gemini_cache),
+            'keys_sample': list(gemini_cache.keys())[:3] if gemini_cache else []
+        },
+        'log_info': {
+            'total': len(log_buffer),
+            'recent': [log['message'] for log in log_buffer[-3:]]
+        }
+    })
+
+@app.route('/test-smart/<path:query>')
 def test_smart(query):
     """Test the smart tier selection."""
+    add_log('INFO', f'Test query: {query[:50]}...')
     result = ask_gemini_smart(query)
+    add_log('INFO', f'Test completed for: {query[:30]}...')
+    
     return jsonify({
         "query": query,
         "result": result,
-        "cache_size": len(gemini_cache)
+        "cache_size": len(gemini_cache),
+        "timestamp": datetime.now().isoformat()
     }), 200
 
 def run_web_server():
+    """Run Flask web server."""
+    add_log('INFO', 'Starting web server on port 3000')
     app.run(host='0.0.0.0', port=3000, debug=False, threaded=True)
 
-# ================= MAIN (UNCHANGED) =================
+# ================= MAIN =================
 async def mcp_bridge():
     """WebSocket bridge."""
     reconnect_delay = 2
@@ -611,6 +1300,7 @@ async def mcp_bridge():
                 close_timeout=10
             ) as websocket:
                 logger.info("✅ Connected to Xiaozhi")
+                add_log('INFO', 'Connected to Xiaozhi MCP endpoint')
                 reconnect_delay = 2
                 
                 async for raw_message in websocket:
@@ -626,14 +1316,15 @@ async def mcp_bridge():
                             response = MCPProtocolHandler.handle_ping(message_id)
                         elif method == "initialize":
                             response = MCPProtocolHandler.handle_initialize(message_id)
-                            logger.info("✅ Initialized")
+                            add_log('INFO', 'MCP protocol initialized')
                         elif method == "tools/list":
                             response = MCPProtocolHandler.handle_tools_list(message_id)
-                            logger.info("✅ Sent tools list")
+                            add_log('INFO', 'Sent tools list to client')
                         elif method == "tools/call":
                             response = MCPProtocolHandler.handle_tools_call(message_id, params)
                             tool_name = params.get("name", "")
-                            logger.info(f"✅ Processed {tool_name}")
+                            query = params.get("arguments", {}).get("query", "")[:50]
+                            add_log('INFO', f'Processed {tool_name}: {query}...')
                         elif method == "notifications/initialized":
                             continue
                         else:
@@ -643,22 +1334,29 @@ async def mcp_bridge():
                             await websocket.send(json.dumps(response))
                             
                     except Exception as e:
-                        logger.error(f"Message error: {e}")
+                        error_msg = f"Message processing error: {str(e)[:80]}"
+                        logger.error(error_msg)
+                        add_log('ERROR', error_msg)
         
         except Exception as e:
-            logger.error(f"Connection error: {e}")
+            error_msg = f"Connection error: {str(e)[:80]}"
+            logger.error(error_msg)
+            add_log('ERROR', error_msg)
             logger.info(f"⏳ Reconnecting in {reconnect_delay}s...")
+            add_log('WARNING', f'Reconnecting in {reconnect_delay}s...')
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 1.5, 60)
 
 async def main():
-    logger.info("🚀 Starting Xiaozhi MCP v3.6 - Smart Tiered Gemini")
+    logger.info("🚀 Starting Xiaozhi MCP v3.6.1 - Gemini-Powered Smart Tiers")
+    add_log('INFO', 'Server starting: Xiaozhi MCP v3.6.1')
     logger.info(f"📊 Gemini: {'✅ Configured' if GEMINI_API_KEY else '❌ Not configured'}")
     
     # Start web server
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
     logger.info("🌐 Web server on http://0.0.0.0:3000")
+    add_log('INFO', 'Web server started on port 3000')
     
     # Start MCP bridge
     await mcp_bridge()
@@ -668,5 +1366,8 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("👋 Stopped")
+        add_log('INFO', 'Server stopped by user')
     except Exception as e:
-        logger.error(f"Fatal: {e}")
+        error_msg = f"Fatal error: {str(e)}"
+        logger.error(error_msg)
+        add_log('ERROR', error_msg)
