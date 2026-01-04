@@ -1,11 +1,11 @@
-# main.py - XIAOZHI MCP SERVER v3.6 - TIERED MODEL SELECTION
+# main.py - XIAOZHI MCP SERVER v3.6 - GEMINI-POWERED TIER SELECTION
 import os
 import asyncio
 import json
 import websockets
 import requests
 import logging
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template_string
 import threading
 import time
 import sys
@@ -42,112 +42,120 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ================= TIERED MODEL SELECTION =================
+# ================= GEMINI-POWERED TIER SELECTION =================
 class SmartModelSelector:
-    """Smart model selection based on YOUR exact tiers."""
+    """Smart model selection using Gemini 2.5 Flash-Lite for classification."""
     
-    # YOUR EXACT TIERS
+    # Model tiers based on classification
     TIERS = {
-        "HARD": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.5-flash-lite"],
-        "MEDIUM": ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"],
-        "SIMPLE": ["gemini-2.5-flash-lite"]
+        "HARD": "gemini-2.5-pro",
+        "MEDIUM": "gemini-2.5-flash", 
+        "SIMPLE": "gemini-2.5-flash-lite"
     }
     
-    # Hard task keywords (use Pro)
-    HARD_KEYWORDS = [
-        'explain in detail', 'analyze', 'compare and contrast', 'evaluate',
-        'write code for', 'debug', 'optimize', 'mathematical proof',
-        'scientific analysis', 'research paper', 'thesis', 'essay',
-        'comprehensive', 'detailed analysis', 'step by step guide',
-        'programming', 'algorithm', 'complex', 'advanced', 'technical'
-    ]
-    
-    # Medium task keywords (use Flash)
-    MEDIUM_KEYWORDS = [
-        'how to', 'what is', 'why does', 'when was', 'where is',
-        'difference between', 'benefits of', 'advantages', 'disadvantages',
-        'guide', 'tutorial', 'instructions', 'process', 'method',
-        'explain', 'describe', 'summary', 'overview', 'basics of'
-    ]
-    
-    # Simple task keywords (use Flash-Lite)
-    SIMPLE_KEYWORDS = [
-        'yes', 'no', 'ok', 'hello', 'hi', 'thanks', 'thank you',
-        'weather', 'time', 'date', 'calculate', 'convert', 'simple',
-        'fact', 'trivia', 'joke', 'quote', 'greeting', 'short answer',
-        'quick', 'brief', 'define', 'meaning of', 'what time'
-    ]
+    @staticmethod
+    def classify_query_with_gemini(query):
+        """Use Gemini 2.5 Flash-Lite to classify query into HARD, MEDIUM, or SIMPLE."""
+        try:
+            if not GEMINI_API_KEY:
+                logger.warning("No Gemini API key, using fallback classification")
+                return "MEDIUM"
+            
+            # Prepare the classification prompt
+            classification_prompt = f"""Please help me sort this query into 3 tiers: 
+Hard (handled by Gemini 2.5 Pro), 
+Medium (Handled by Gemini 2.5 Flash), and 
+Simple (Handled by Gemini 2.5 Flash-Lite): "{query}"
+
+Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."""
+            
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent"
+            
+            headers = {
+                "Content-Type": "application/json"
+            }
+            
+            data = {
+                "contents": [{
+                    "parts": [{
+                        "text": classification_prompt
+                    }]
+                }],
+                "generationConfig": {
+                    "maxOutputTokens": 10,
+                    "temperature": 0.1,
+                    "topP": 0.1,
+                    "topK": 1,
+                }
+            }
+            
+            params = {"key": GEMINI_API_KEY}
+            
+            # Quick timeout for classification
+            response = requests.post(url, headers=headers, json=data, params=params, timeout=5)
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            if "candidates" in result and len(result["candidates"]) > 0:
+                candidate = result["candidates"][0]
+                if "content" in candidate:
+                    parts = candidate["content"].get("parts", [])
+                    if parts and len(parts) > 0 and "text" in parts[0]:
+                        classification = parts[0]["text"].strip().upper()
+                        
+                        # Extract just HARD/MEDIUM/SIMPLE from response
+                        for tier in ["HARD", "MEDIUM", "SIMPLE"]:
+                            if tier in classification:
+                                return tier
+                        
+                        # Fallback if not found
+                        logger.warning(f"Unexpected classification: {classification}")
+            
+            return "MEDIUM"  # Default fallback
+            
+        except requests.exceptions.Timeout:
+            logger.warning("⏰ Classification timeout, using MEDIUM as default")
+            return "MEDIUM"
+        except Exception as e:
+            logger.error(f"❌ Classification error: {e}")
+            return "MEDIUM"
     
     @staticmethod
     def select_model(query):
-        """Select model based on YOUR exact tiers."""
-        query_lower = query.lower()
-        words = len(query_lower.split())
+        """Select model using Gemini-powered classification."""
+        # Get classification from Gemini
+        tier = SmartModelSelector.classify_query_with_gemini(query)
+        logger.info(f"🎯 Gemini classified as: {tier} for '{query[:50]}...'")
         
-        # Check for hard tasks first
-        for keyword in SmartModelSelector.HARD_KEYWORDS:
-            if keyword in query_lower:
-                logger.info(f"🎯 HARD task detected: '{keyword}' → Pro tier")
-                return {
-                    "tier": "HARD",
-                    "models": SmartModelSelector.TIERS["HARD"],
-                    "primary": "gemini-2.5-pro",
-                    "tokens": 2000,
-                    "timeout": 30
-                }
-        
-        # Check for medium tasks
-        for keyword in SmartModelSelector.MEDIUM_KEYWORDS:
-            if keyword in query_lower:
-                logger.info(f"🎯 MEDIUM task detected: '{keyword}' → Flash tier")
-                return {
-                    "tier": "MEDIUM",
-                    "models": SmartModelSelector.TIERS["MEDIUM"],
-                    "primary": "gemini-2.5-flash",
-                    "tokens": 1000,
-                    "timeout": 20
-                }
-        
-        # Check for simple tasks
-        for keyword in SmartModelSelector.SIMPLE_KEYWORDS:
-            if keyword in query_lower:
-                logger.info(f"🎯 SIMPLE task detected: '{keyword}' → Flash-Lite tier")
-                return {
-                    "tier": "SIMPLE",
-                    "models": SmartModelSelector.TIERS["SIMPLE"],
-                    "primary": "gemini-2.5-flash-lite",
-                    "tokens": 500,
-                    "timeout": 10
-                }
-        
-        # Default based on query length
-        if words > 20:
-            logger.info(f"🎯 Long query ({words} words) → HARD tier")
-            return {
-                "tier": "HARD",
-                "models": SmartModelSelector.TIERS["HARD"],
-                "primary": "gemini-2.5-pro",
-                "tokens": 1500,
-                "timeout": 25
-            }
-        elif words > 10:
-            logger.info(f"🎯 Medium query ({words} words) → MEDIUM tier")
-            return {
-                "tier": "MEDIUM",
-                "models": SmartModelSelector.TIERS["MEDIUM"],
-                "primary": "gemini-2.5-flash",
-                "tokens": 800,
-                "timeout": 15
-            }
-        else:
-            logger.info(f"🎯 Short query ({words} words) → SIMPLE tier")
-            return {
-                "tier": "SIMPLE",
-                "models": SmartModelSelector.TIERS["SIMPLE"],
-                "primary": "gemini-2.5-flash-lite",
-                "tokens": 400,
+        # Map tier to model and parameters
+        model_configs = {
+            "HARD": {
+                "model": "gemini-2.5-pro",
+                "tokens": 2000,
+                "timeout": 30
+            },
+            "MEDIUM": {
+                "model": "gemini-2.5-flash", 
+                "tokens": 1000,
+                "timeout": 20
+            },
+            "SIMPLE": {
+                "model": "gemini-2.5-flash-lite",
+                "tokens": 500,
                 "timeout": 10
             }
+        }
+        
+        config = model_configs.get(tier, model_configs["MEDIUM"])
+        
+        return {
+            "tier": tier,
+            "model": config["model"],
+            "tokens": config["tokens"],
+            "timeout": config["timeout"],
+            "fallbacks": ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        }
 
 # ================= GEMINI API CLIENT =================
 gemini_cache = {}
@@ -215,18 +223,18 @@ def call_gemini_api(query, model="gemini-2.5-flash", max_tokens=1000, timeout=20
         return None, "ERROR"
 
 def ask_gemini_smart(query):
-    """Smart Gemini query with YOUR tiered model selection."""
+    """Smart Gemini query with Gemini-powered tier selection."""
     try:
         if not query or not query.strip():
             return "Please provide a question."
         
-        # Step 1: Select tier and model
+        # Step 1: Get classification and model selection
         model_info = SmartModelSelector.select_model(query)
         tier = model_info["tier"]
-        models_to_try = model_info["models"]
-        primary_model = model_info["primary"]
+        primary_model = model_info["model"]
         max_tokens = model_info["tokens"]
         timeout = model_info["timeout"]
+        fallbacks = model_info["fallbacks"]
         
         logger.info(f"🤖 Using {tier} tier: {primary_model} for '{query[:50]}...'")
         
@@ -238,20 +246,19 @@ def ask_gemini_smart(query):
                 logger.info(f"♻️ Cached response from {primary_model}")
                 return f"[{tier} - Cached] {response}"
         
-        # Step 2: Try models in tier order
+        # Step 2: Try primary model
+        models_to_try = [primary_model] + fallbacks
+        
         for model in models_to_try:
             logger.info(f"🔄 Trying model: {model}")
             
-            # Adjust tokens/timeout based on model
-            if model == "gemini-2.5-pro":
-                model_tokens = max_tokens
-                model_timeout = timeout
-            elif model == "gemini-2.5-flash":
-                model_tokens = min(max_tokens, 1000)
-                model_timeout = min(timeout, 20)
-            else:  # flash-lite or 2.0-flash
+            # Adjust tokens/timeout for fallback models
+            if model != primary_model:
                 model_tokens = min(max_tokens, 500)
                 model_timeout = min(timeout, 15)
+            else:
+                model_tokens = max_tokens
+                model_timeout = timeout
             
             result, status = call_gemini_api(query, model, model_tokens, model_timeout)
             
@@ -263,44 +270,26 @@ def ask_gemini_smart(query):
                 return f"[{tier} - {model}] {result}"
             
             elif status == "MODEL_NOT_AVAILABLE":
-                logger.warning(f"❌ Model {model} not available, trying next in tier")
+                logger.warning(f"❌ Model {model} not available, trying next")
                 continue
             
             elif status == "TIMEOUT":
-                logger.warning(f"⏰ Model {model} timeout, trying next in tier")
+                logger.warning(f"⏰ Model {model} timeout, trying next")
                 continue
             
             elif status == "RATE_LIMITED":
-                # If rate limited, wait and try same model again
-                logger.info(f"⏳ Rate limited on {model}, waiting 2s")
-                time.sleep(2)
-                result, status = call_gemni_api(query, model, model_tokens, model_timeout)
-                if status == "SUCCESS" and result:
-                    gemini_cache[cache_key] = (datetime.now(), result)
-                    return f"[{tier} - {model}] {result}"
+                logger.warning(f"⏰ Model {model} rate limited, trying next")
                 continue
         
-        # If all models in tier failed, fall back to basic
-        logger.warning(f"❌ All models in {tier} tier failed, using basic fallback")
-        return ask_gemini_basic(query)
+        # If all models failed
+        logger.error(f"❌ All models failed for query: {query}")
+        return "Gemini AI is currently unavailable. Please try again in a moment."
         
     except Exception as e:
         logger.error(f"❌ Smart Gemini error: {e}")
         return f"AI error: {str(e)[:80]}"
 
-def ask_gemini_basic(query):
-    """Basic fallback if smart selection fails."""
-    # Try the most reliable free models
-    fallback_models = ["gemini-1.5-flash", "gemini-2.0-flash"]
-    
-    for model in fallback_models:
-        result, status = call_gemini_api(query, model, 500, 10)
-        if status == "SUCCESS" and result:
-            return f"[Fallback - {model}] {result}"
-    
-    return "Gemini AI is currently unavailable. Please try again in a moment."
-
-# ================= OTHER TOOLS (OPTIMIZED) =================
+# ================= OTHER TOOLS (UNCHANGED) =================
 def google_search(query, max_results=10):
     """Google Search."""
     try:
@@ -409,7 +398,7 @@ def wikipedia_search(query, max_results=3):
         logger.error(f"Wikipedia error: {e}")
         return "Wikipedia search error."
 
-# ================= MCP PROTOCOL HANDLER =================
+# ================= MCP PROTOCOL HANDLER (UNCHANGED) =================
 class MCPProtocolHandler:
     @staticmethod
     def handle_initialize(message_id):
@@ -421,7 +410,7 @@ class MCPProtocolHandler:
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "smart-tier-gemini",
-                    "version": "3.6.0"
+                    "version": "3.6.1"
                 }
             }
         }
@@ -514,9 +503,23 @@ class MCPProtocolHandler:
                 "error": {"code": -32000, "message": f"Error: {str(e)[:80]}"}
             }
 
-# ================= WEB SERVER =================
+# ================= WEB SERVER WITH TEST BUTTONS =================
 app = Flask(__name__)
 server_start_time = time.time()
+
+# Store test queries for the UI
+test_queries = [
+    "Explain quantum computing in simple terms",
+    "What is the capital of France?",
+    "Write a Python function to calculate Fibonacci sequence",
+    "What time is it?",
+    "Compare and contrast machine learning and deep learning",
+    "How to make a cup of tea",
+    "Calculate 15 * 27",
+    "What are the benefits of regular exercise?",
+    "Debug this code: for i in range(10): print(i",
+    "Tell me a joke"
+]
 
 @app.route('/')
 def index():
@@ -524,77 +527,267 @@ def index():
     hours, remainder = divmod(uptime, 3600)
     minutes, seconds = divmod(remainder, 60)
     
-    return f"""
+    # Generate test buttons HTML
+    test_buttons_html = ""
+    for i, query in enumerate(test_queries):
+        test_buttons_html += f'''
+        <div class="test-query">
+            <button onclick="testQuery('{query.replace("'", "\\'")}')">
+                Test: {query[:40]}{'...' if len(query) > 40 else ''}
+            </button>
+            <div id="result-{i}" class="result"></div>
+        </div>
+        '''
+    
+    return render_template_string('''
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Xiaozhi MCP v3.6</title>
+        <title>Xiaozhi MCP v3.6.1</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
-            body {{ font-family: -apple-system, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }}
-            .header {{ background: linear-gradient(135deg, #4285F4 0%, #34A853 100%); 
-                      color: white; padding: 2rem; border-radius: 10px; margin-bottom: 2rem; }}
-            .tier {{ padding: 1rem; margin: 1rem 0; border-radius: 8px; }}
-            .hard {{ background: #FFEBEE; border-left: 4px solid #F44336; }}
-            .medium {{ background: #FFF3E0; border-left: 4px solid #FF9800; }}
-            .simple {{ background: #E8F5E9; border-left: 4px solid #4CAF50; }}
+            body { 
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; 
+                max-width: 1000px; 
+                margin: 0 auto; 
+                padding: 20px;
+                background: #f5f5f5;
+            }
+            .header { 
+                background: linear-gradient(135deg, #4285F4 0%, #34A853 100%); 
+                color: white; 
+                padding: 2rem; 
+                border-radius: 12px; 
+                margin-bottom: 2rem;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            }
+            .tier { 
+                padding: 1.5rem; 
+                margin: 1.2rem 0; 
+                border-radius: 10px;
+                box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+            }
+            .hard { 
+                background: linear-gradient(135deg, #FFEBEE 0%, #FFCDD2 100%); 
+                border-left: 6px solid #F44336; 
+            }
+            .medium { 
+                background: linear-gradient(135deg, #FFF3E0 0%, #FFE0B2 100%); 
+                border-left: 6px solid #FF9800; 
+            }
+            .simple { 
+                background: linear-gradient(135deg, #E8F5E9 0%, #C8E6C9 100%); 
+                border-left: 6px solid #4CAF50; 
+            }
+            .test-section {
+                background: white;
+                padding: 2rem;
+                border-radius: 12px;
+                margin: 2rem 0;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+            }
+            .test-query {
+                margin: 1rem 0;
+                padding: 1rem;
+                background: #f8f9fa;
+                border-radius: 8px;
+                border-left: 4px solid #4285F4;
+            }
+            button {
+                background: #4285F4;
+                color: white;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 6px;
+                cursor: pointer;
+                font-size: 16px;
+                margin: 5px;
+                transition: all 0.3s;
+                width: 100%;
+                text-align: left;
+            }
+            button:hover {
+                background: #3367D6;
+                transform: translateY(-2px);
+                box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+            }
+            .result {
+                margin-top: 1rem;
+                padding: 1rem;
+                background: white;
+                border-radius: 6px;
+                border: 1px solid #ddd;
+                display: none;
+                white-space: pre-wrap;
+                font-family: monospace;
+                max-height: 300px;
+                overflow-y: auto;
+            }
+            .status-bar {
+                background: white;
+                padding: 1rem;
+                border-radius: 8px;
+                margin: 1rem 0;
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+            }
+            .loading {
+                color: #FF9800;
+                font-weight: bold;
+            }
+            .success {
+                color: #4CAF50;
+                font-weight: bold;
+            }
+            .error {
+                color: #F44336;
+                font-weight: bold;
+            }
         </style>
     </head>
     <body>
         <div class="header">
-            <h1>🚀 Xiaozhi MCP v3.6</h1>
-            <p>SMART Tiered Gemini Selection</p>
+            <h1>🚀 Xiaozhi MCP v3.6.1</h1>
+            <p>Gemini-Powered Smart Tier Selection</p>
         </div>
         
-        <h2>🎯 Your Model Tiers:</h2>
+        <div class="status-bar">
+            <div>
+                <strong>Uptime:</strong> {{hours}}h {{minutes}}m {{seconds}}s
+            </div>
+            <div>
+                <strong>Cache:</strong> {{cache_size}} items
+            </div>
+            <div>
+                <strong>Status:</strong> <span id="status-indicator" class="success">✅ Healthy</span>
+            </div>
+        </div>
+        
+        <h2>🎯 Gemini-Powered Model Tiers:</h2>
         
         <div class="tier hard">
-            <h3>🔴 HARD Tasks → Pro Tier</h3>
-            <p><strong>Models:</strong> gemini-2.5-pro → gemini-2.5-flash → gemini-2.5-flash-lite</p>
-            <p><strong>For:</strong> Complex analysis, coding, detailed explanations</p>
+            <h3>🔴 HARD Tasks → Gemini 2.5 Pro</h3>
+            <p><strong>For:</strong> Complex analysis, coding, detailed explanations, research</p>
+            <p><strong>Selected by Gemini Flash-Lite classification</strong></p>
         </div>
         
         <div class="tier medium">
-            <h3>🟡 MEDIUM Tasks → Flash Tier</h3>
-            <p><strong>Models:</strong> gemini-2.5-flash → gemini-2.5-flash-lite → gemini-2.0-flash</p>
-            <p><strong>For:</strong> General Q&A, explanations, guides</p>
+            <h3>🟡 MEDIUM Tasks → Gemini 2.5 Flash</h3>
+            <p><strong>For:</strong> General Q&A, explanations, guides, comparisons</p>
+            <p><strong>Selected by Gemini Flash-Lite classification</strong></p>
         </div>
         
         <div class="tier simple">
-            <h3>🟢 SIMPLE Tasks → Flash-Lite Tier</h3>
-            <p><strong>Models:</strong> gemini-2.5-flash-lite</p>
-            <p><strong>For:</strong> Quick answers, facts, simple questions</p>
+            <h3>🟢 SIMPLE Tasks → Gemini 2.5 Flash-Lite</h3>
+            <p><strong>For:</strong> Quick answers, facts, simple questions, calculations</p>
+            <p><strong>Selected by Gemini Flash-Lite classification</strong></p>
         </div>
         
-        <p>Uptime: {hours}h {minutes}m {seconds}s | Cache: {len(gemini_cache)} items</p>
+        <div class="test-section">
+            <h2>🧪 Test Tier Classification</h2>
+            <p>Click any button to test how Gemini classifies and processes the query:</p>
+            
+            ''' + test_buttons_html + '''
+            
+            <div style="margin-top: 2rem;">
+                <h3>Custom Test:</h3>
+                <input type="text" id="custom-query" placeholder="Enter your own query..." style="width: 70%; padding: 10px; border-radius: 6px; border: 1px solid #ddd;">
+                <button onclick="testCustomQuery()" style="width: 25%;">Test Custom Query</button>
+                <div id="custom-result" class="result"></div>
+            </div>
+        </div>
+        
+        <script>
+            function testQuery(query) {
+                const button = event.target;
+                const resultId = button.parentElement.querySelector('.result').id;
+                const resultDiv = document.getElementById(resultId);
+                
+                // Show loading
+                resultDiv.innerHTML = '<div class="loading">⏳ Gemini is classifying and processing...</div>';
+                resultDiv.style.display = 'block';
+                
+                // Call test endpoint
+                fetch('/test-smart/' + encodeURIComponent(query))
+                    .then(response => response.json())
+                    .then(data => {
+                        resultDiv.innerHTML = `
+                            <div class="success">
+                                ✅ Classification & Processing Complete
+                            </div>
+                            <hr>
+                            <strong>Query:</strong> ${data.query}<br><br>
+                            <strong>Result:</strong><br>${data.result.replace(/\n/g, '<br>')}
+                        `;
+                    })
+                    .catch(error => {
+                        resultDiv.innerHTML = `<div class="error">❌ Error: ${error}</div>`;
+                    });
+            }
+            
+            function testCustomQuery() {
+                const query = document.getElementById('custom-query').value;
+                if (!query) {
+                    alert('Please enter a query');
+                    return;
+                }
+                
+                const resultDiv = document.getElementById('custom-result');
+                resultDiv.innerHTML = '<div class="loading">⏳ Gemini is classifying and processing...</div>';
+                resultDiv.style.display = 'block';
+                
+                fetch('/test-smart/' + encodeURIComponent(query))
+                    .then(response => response.json())
+                    .then(data => {
+                        resultDiv.innerHTML = `
+                            <div class="success">
+                                ✅ Classification & Processing Complete
+                            </div>
+                            <hr>
+                            <strong>Query:</strong> ${data.query}<br><br>
+                            <strong>Result:</strong><br>${data.result.replace(/\n/g, '<br>')}
+                        `;
+                    })
+                    .catch(error => {
+                        resultDiv.innerHTML = `<div class="error">❌ Error: ${error}</div>`;
+                    });
+            }
+        </script>
     </body>
     </html>
-    """
+    ''', 
+    hours=hours, 
+    minutes=minutes, 
+    seconds=seconds,
+    cache_size=len(gemini_cache))
 
 @app.route('/health')
 def health_check():
     return jsonify({
         "status": "healthy",
-        "version": "3.6.0",
-        "tiers": SmartModelSelector.TIERS,
-        "cache_size": len(gemini_cache)
+        "version": "3.6.1",
+        "gemini_powered": True,
+        "cache_size": len(gemini_cache),
+        "test_queries_count": len(test_queries)
     }), 200
 
-@app.route('/test-smart/<query>')
+@app.route('/test-smart/<path:query>')
 def test_smart(query):
-    """Test the smart tier selection."""
+    """Test the smart tier selection with classification."""
     result = ask_gemini_smart(query)
     return jsonify({
         "query": query,
         "result": result,
-        "cache_size": len(gemini_cache)
+        "cache_size": len(gemini_cache),
+        "timestamp": datetime.now().isoformat()
     }), 200
 
 def run_web_server():
     app.run(host='0.0.0.0', port=3000, debug=False, threaded=True)
 
-# ================= MAIN =================
+# ================= MAIN (UNCHANGED) =================
 async def mcp_bridge():
     """WebSocket bridge."""
     reconnect_delay = 2
@@ -648,13 +841,14 @@ async def mcp_bridge():
             reconnect_delay = min(reconnect_delay * 1.5, 60)
 
 async def main():
-    logger.info("🚀 Starting Xiaozhi MCP v3.6 - Smart Tiered Gemini")
+    logger.info("🚀 Starting Xiaozhi MCP v3.6.1 - Gemini-Powered Smart Tiers")
     logger.info(f"📊 Gemini: {'✅ Configured' if GEMINI_API_KEY else '❌ Not configured'}")
     
     # Start web server
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
     logger.info("🌐 Web server on http://0.0.0.0:3000")
+    logger.info("🧪 Test interface available at http://0.0.0.0:3000")
     
     # Start MCP bridge
     await mcp_bridge()
