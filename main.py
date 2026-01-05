@@ -1,4 +1,4 @@
-# main.py - XIAOZHI MCP SERVER v3.6.1 - ASYNC PING FIX (IMPORT FIXED)
+# main.py - XIAOZHI MCP SERVER v3.6.1 - ASYNC PING FIX (DEBUG EDITION)
 import os
 import asyncio
 import json
@@ -15,7 +15,9 @@ import hashlib
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import uuid
-from typing import Dict
+from typing import Dict, List
+from dataclasses import dataclass
+from enum import Enum
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 load_dotenv()
@@ -31,6 +33,11 @@ if not XIAOZHI_WS:
     print("❌ ERROR: XIAOZHI_WS environment variable is not set!")
     print("   Go to Render.com dashboard → Environment → Add XIAOZHI_WS")
     sys.exit(1)
+
+# ================= DEBUG CONFIGURATION =================
+DEBUG_PING = True  # Enable detailed ping debugging
+PING_TRACE_LOG = []  # Store ping events for real-time viewing
+MAX_PING_TRACE = 100
 
 # ================= ASYNC PING CONFIGURATION =================
 ASYNC_PING_MODE = True
@@ -68,6 +75,115 @@ keep_alive_messages = [
     "Preparing response... 🚀"
 ]
 
+# ================= PING DEBUG DATA STRUCTURES =================
+@dataclass
+class PingEvent:
+    """Track individual ping events"""
+    timestamp: datetime
+    request_id: str
+    event_type: str  # "TASK_CREATED", "FIRST_PING_SENT", "CONTINUOUS_PING", "WS_ERROR", "TASK_COMPLETED"
+    details: str
+    websocket_open: bool = False
+    success: bool = False
+    
+    def to_dict(self):
+        return {
+            "time": self.timestamp.strftime('%H:%M:%S.%f')[:-3],
+            "request_id": self.request_id,
+            "type": self.event_type,
+            "details": self.details,
+            "ws_open": self.websocket_open,
+            "success": self.success
+        }
+
+class PingTracker:
+    """Track all ping activity for debugging"""
+    
+    def __init__(self):
+        self.events: List[PingEvent] = []
+        self.request_stats: Dict[str, Dict] = {}
+    
+    def add_event(self, request_id: str, event_type: str, details: str, 
+                  websocket_open: bool = False, success: bool = False):
+        """Add a ping event"""
+        event = PingEvent(
+            timestamp=datetime.now(),
+            request_id=request_id,
+            event_type=event_type,
+            details=details,
+            websocket_open=websocket_open,
+            success=success
+        )
+        
+        self.events.append(event)
+        
+        # Keep only recent events
+        if len(self.events) > MAX_PING_TRACE:
+            self.events.pop(0)
+        
+        # Update request stats
+        if request_id not in self.request_stats:
+            self.request_stats[request_id] = {
+                "created": datetime.now(),
+                "first_ping_sent": None,
+                "ping_count": 0,
+                "last_ping": None,
+                "completed": None,
+                "errors": 0
+            }
+        
+        # Update stats based on event type
+        stats = self.request_stats[request_id]
+        if event_type == "FIRST_PING_SENT":
+            stats["first_ping_sent"] = datetime.now()
+            stats["ping_count"] += 1
+        elif event_type == "CONTINUOUS_PING":
+            stats["ping_count"] += 1
+            stats["last_ping"] = datetime.now()
+        elif event_type == "WS_ERROR":
+            stats["errors"] += 1
+        elif event_type == "TASK_COMPLETED":
+            stats["completed"] = datetime.now()
+        
+        # Log if debugging enabled
+        if DEBUG_PING:
+            logger.debug(f"📊 PING EVENT: {event_type} for {request_id}: {details}")
+        
+        return event
+    
+    def get_recent_events(self, limit: int = 20):
+        """Get recent ping events"""
+        return [e.to_dict() for e in self.events[-limit:]]
+    
+    def get_request_stats(self, request_id: str):
+        """Get stats for a specific request"""
+        return self.request_stats.get(request_id, {})
+    
+    def get_active_requests(self):
+        """Get all active ping requests"""
+        active = []
+        for req_id, stats in self.request_stats.items():
+            if stats.get("completed") is None:  # Not completed yet
+                active.append(req_id)
+        return active
+    
+    def clear_old_requests(self, older_than_minutes: int = 5):
+        """Clear old completed requests"""
+        cutoff = datetime.now() - timedelta(minutes=older_than_minutes)
+        to_remove = []
+        
+        for req_id, stats in self.request_stats.items():
+            if stats.get("completed") and stats["completed"] < cutoff:
+                to_remove.append(req_id)
+        
+        for req_id in to_remove:
+            del self.request_stats[req_id]
+        
+        return len(to_remove)
+
+# Global ping tracker
+ping_tracker = PingTracker()
+
 # ================= ASYNC KEEP-ALIVE MANAGER =================
 class AsyncPingManager:
     """Async-based keep-alive system (THREAD-SAFE for WebSocket)."""
@@ -79,117 +195,236 @@ class AsyncPingManager:
     async def start_pinging(self, websocket, request_id: str, duration: int = 30):
         """Start async ping task for a request."""
         try:
+            # PHASE 1: Verify parameters
+            if not websocket:
+                logger.error(f"❌ No WebSocket provided for {request_id}")
+                ping_tracker.add_event(request_id, "WS_ERROR", "No WebSocket provided", success=False)
+                return None
+            
+            # Track request start
+            ping_tracker.add_event(request_id, "TASK_CREATED", 
+                                   f"Starting ping task with duration={duration}s", 
+                                   websocket_open=websocket.open if hasattr(websocket, 'open') else False,
+                                   success=True)
+            
             logger.info(f"🚀 STARTING ASYNC PING for {request_id}")
+            logger.debug(f"  • WebSocket open: {websocket.open}")
+            logger.debug(f"  • Duration: {duration}s")
+            logger.debug(f"  • First ping delay: {FIRST_PING_DELAY}s")
+            logger.debug(f"  • Active tasks: {len(self.active_tasks)}")
             
             # Store WebSocket reference
             self.websocket_refs[request_id] = websocket
             
             # Create and store ping task
             task = asyncio.create_task(
-                self._ping_worker(websocket, request_id, duration)
+                self._ping_worker(websocket, request_id, duration),
+                name=f"ping_{request_id}"
             )
             self.active_tasks[request_id] = task
             
-            # Start the task
+            # Add done callback for cleanup
             task.add_done_callback(lambda t: self._cleanup(request_id))
             
             logger.info(f"✅ ASYNC PING STARTED for {request_id}")
+            logger.debug(f"  • Task created: {task.get_name()}")
+            logger.debug(f"  • Task done: {task.done()}")
+            logger.debug(f"  • Task cancelled: {task.cancelled()}")
+            
             return task
             
         except Exception as e:
-            logger.error(f"❌ Failed to start async ping: {e}")
+            error_msg = f"Failed to start async ping: {str(e)}"
+            logger.error(f"❌ {error_msg}")
+            ping_tracker.add_event(request_id, "WS_ERROR", error_msg, success=False)
             return None
     
     async def _ping_worker(self, websocket, request_id: str, duration: int):
         """Async ping worker - runs in same event loop as WebSocket."""
+        ping_count = 0
+        start_time = time.time()
+        
         try:
-            start_time = time.time()
-            ping_count = 0
+            logger.debug(f"📡 Ping worker STARTED for {request_id}")
+            logger.debug(f"  • Event loop: {asyncio.get_running_loop()}")
+            logger.debug(f"  • Duration: {duration}s")
+            logger.debug(f"  • WebSocket: {id(websocket)}")
             
             # PHASE 1: INSTANT FIRST PING (50ms)
+            logger.debug(f"⏳ Waiting {FIRST_PING_DELAY}s for first ping...")
             await asyncio.sleep(FIRST_PING_DELAY)
-            await self._send_safe_ping(websocket, request_id, 0)
-            logger.info(f"✅ INSTANT PING #1 sent for {request_id}")
+            
+            # Send first ping
+            first_ping_success = await self._send_safe_ping(websocket, request_id, ping_count, is_first=True)
+            if first_ping_success:
+                ping_count += 1
+                ping_tracker.add_event(request_id, "FIRST_PING_SENT", 
+                                       f"First ping sent after {FIRST_PING_DELAY}s",
+                                       websocket_open=websocket.open,
+                                       success=True)
+                logger.info(f"✅ INSTANT PING #1 sent for {request_id} (after {FIRST_PING_DELAY}s)")
+            else:
+                ping_tracker.add_event(request_id, "WS_ERROR", 
+                                       "Failed to send first ping",
+                                       websocket_open=websocket.open,
+                                       success=False)
+                logger.warning(f"⚠️ Failed to send first ping for {request_id}")
             
             # PHASE 2: CONTINUOUS PINGS (0.8s interval)
+            last_ping_time = time.time()
+            
             while time.time() - start_time < duration:
+                # Check if request is still active
                 if not self._is_request_active(request_id):
                     logger.info(f"⚠️ Request {request_id} completed, stopping pings")
+                    ping_tracker.add_event(request_id, "TASK_COMPLETED", 
+                                           "Request marked as completed",
+                                           success=True)
                     break
-                
-                # Wait for interval
-                await asyncio.sleep(CONTINUOUS_PING_INTERVAL)
-                
-                # Send ping
-                success = await self._send_safe_ping(websocket, request_id, ping_count)
-                if success:
-                    ping_count += 1
-                    if ping_count % 5 == 0:  # Log every 5 pings
-                        logger.info(f"📤 Ping #{ping_count} sent for {request_id}")
                 
                 # Check if WebSocket is still connected
                 if not websocket.open:
                     logger.warning(f"⚠️ WebSocket closed for {request_id}, stopping pings")
+                    ping_tracker.add_event(request_id, "WS_ERROR", 
+                                           "WebSocket closed",
+                                           websocket_open=False,
+                                           success=False)
+                    break
+                
+                # Wait for interval
+                elapsed = time.time() - last_ping_time
+                sleep_time = max(0, CONTINUOUS_PING_INTERVAL - elapsed)
+                
+                if sleep_time > 0:
+                    logger.debug(f"💤 Sleeping {sleep_time:.3f}s before next ping")
+                    await asyncio.sleep(sleep_time)
+                
+                # Send ping
+                success = await self._send_safe_ping(websocket, request_id, ping_count, is_first=False)
+                last_ping_time = time.time()
+                
+                if success:
+                    ping_count += 1
+                    ping_tracker.add_event(request_id, "CONTINUOUS_PING", 
+                                           f"Ping #{ping_count} sent",
+                                           websocket_open=websocket.open,
+                                           success=True)
+                    
+                    # Log every 5 pings
+                    if ping_count % 5 == 0:
+                        elapsed_total = time.time() - start_time
+                        logger.info(f"📤 Ping #{ping_count} sent for {request_id} (elapsed: {elapsed_total:.1f}s)")
+                
+                # Check if we should continue
+                if time.time() - start_time >= duration:
+                    logger.debug(f"⏰ Duration reached for {request_id}")
                     break
             
-            logger.info(f"✅ Ping worker completed for {request_id} ({ping_count} pings)")
+            logger.info(f"✅ Ping worker completed for {request_id} ({ping_count} pings in {time.time()-start_time:.1f}s)")
+            ping_tracker.add_event(request_id, "TASK_COMPLETED", 
+                                   f"Completed with {ping_count} pings",
+                                   success=True)
             
+        except asyncio.CancelledError:
+            logger.info(f"🛑 Ping worker CANCELLED for {request_id}")
+            ping_tracker.add_event(request_id, "TASK_COMPLETED", 
+                                   "Cancelled by system",
+                                   success=False)
+            raise
         except Exception as e:
-            logger.error(f"❌ Ping worker error for {request_id}: {e}")
+            error_msg = f"Ping worker error: {str(e)}"
+            logger.error(f"❌ {error_msg} for {request_id}")
+            ping_tracker.add_event(request_id, "WS_ERROR", error_msg, success=False)
         finally:
             self._cleanup(request_id)
     
-    async def _send_safe_ping(self, websocket, request_id: str, ping_count: int) -> bool:
+    async def _send_safe_ping(self, websocket, request_id: str, ping_count: int, is_first: bool = False) -> bool:
         """Safely send a ping message (handles WebSocket errors)."""
         try:
-            if not websocket or not websocket.open:
+            # Check WebSocket state
+            if not websocket:
+                logger.debug(f"⚠️ No WebSocket object for {request_id}")
+                return False
+            
+            if not hasattr(websocket, 'open'):
+                logger.debug(f"⚠️ WebSocket has no 'open' attribute for {request_id}")
+                return False
+            
+            ws_open = websocket.open
+            logger.debug(f"🔍 WebSocket check for {request_id}: open={ws_open}, ping_count={ping_count}")
+            
+            if not ws_open:
                 logger.warning(f"⚠️ WebSocket not open for {request_id}")
                 return False
             
+            # Prepare ping message
             message_idx = ping_count % len(keep_alive_messages)
+            ping_type = "FIRST" if is_first else f"CONTINUOUS#{ping_count}"
+            
             ping_message = {
                 "jsonrpc": "2.0",
                 "method": "notifications/progress",
                 "params": {
                     "progress": {
                         "type": "text",
-                        "text": f"⏳ {keep_alive_messages[message_idx]}"
+                        "text": f"⏳ {keep_alive_messages[message_idx]} [{ping_type}]"
                     }
                 }
             }
             
+            # Log before sending
+            logger.debug(f"📨 Preparing to send ping for {request_id}")
+            logger.debug(f"  • Message: {ping_message['params']['progress']['text']}")
+            logger.debug(f"  • WebSocket ID: {id(websocket)}")
+            logger.debug(f"  • Is open: {websocket.open}")
+            
+            # Send the ping
             await websocket.send(json.dumps(ping_message))
+            
+            # Log success
+            logger.debug(f"✅ Ping sent successfully for {request_id}")
             return True
             
-        except websockets.exceptions.ConnectionClosed:
-            logger.warning(f"⚠️ Connection closed while pinging {request_id}")
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.warning(f"⚠️ Connection closed while pinging {request_id}: {e.code} - {e.reason}")
+            return False
+        except websockets.exceptions.WebSocketException as e:
+            logger.error(f"❌ WebSocket exception for {request_id}: {e}")
             return False
         except Exception as e:
-            logger.error(f"❌ Ping send error for {request_id}: {e}")
+            logger.error(f"❌ Unexpected error sending ping for {request_id}: {e}")
             return False
     
     def _is_request_active(self, request_id: str) -> bool:
         """Check if request is still active."""
-        return request_id in active_requests and active_requests[request_id]
+        is_active = request_id in active_requests and active_requests[request_id]
+        logger.debug(f"🔍 Active check for {request_id}: {is_active}")
+        return is_active
     
     def _cleanup(self, request_id: str):
         """Clean up ping task and references."""
         try:
+            logger.debug(f"🧹 Starting cleanup for {request_id}")
+            
             # Cancel task if still running
             if request_id in self.active_tasks:
                 task = self.active_tasks[request_id]
                 if not task.done():
                     task.cancel()
+                    logger.debug(f"  • Task cancelled: {request_id}")
                 del self.active_tasks[request_id]
+                logger.debug(f"  • Task removed from active_tasks: {request_id}")
             
             # Remove WebSocket reference
             if request_id in self.websocket_refs:
                 del self.websocket_refs[request_id]
+                logger.debug(f"  • WebSocket reference removed: {request_id}")
             
             # Remove from active requests
             if request_id in active_requests:
                 del active_requests[request_id]
-                
+                logger.debug(f"  • Removed from active_requests: {request_id}")
+            
             logger.info(f"🧹 Cleaned up ping manager for {request_id}")
             
         except Exception as e:
@@ -197,13 +432,15 @@ class AsyncPingManager:
     
     def stop_all_pings(self):
         """Stop all ping tasks (e.g., on shutdown)."""
+        logger.info(f"🛑 Stopping all ping tasks ({len(self.active_tasks)} active)")
         for request_id, task in list(self.active_tasks.items()):
             if not task.done():
                 task.cancel()
-                logger.info(f"🛑 Stopped ping task for {request_id}")
+                logger.info(f"  • Stopped ping task for {request_id}")
         
         self.active_tasks.clear()
         self.websocket_refs.clear()
+        logger.info("✅ All ping tasks stopped")
 
 # Global ping manager
 ping_manager = AsyncPingManager()
@@ -344,21 +581,33 @@ class AsyncGeminiProcessor:
     async def process_query_async(query: str, tier: str, cache_key: str, websocket, request_id: str):
         """Process query with async pinging and parallel model attempts."""
         try:
-            logger.info(f"🚀 Processing {tier} tier: '{query[:40]}...'")
+            logger.info(f"🚀 Processing {tier} tier: '{query[:40]}...' [ID: {request_id}]")
             
             # Mark request as active
             active_requests[request_id] = True
+            logger.debug(f"📝 Marked {request_id} as active")
+            logger.debug(f"  • Active requests: {list(active_requests.keys())}")
+            logger.debug(f"  • WebSocket: {id(websocket)}, open: {websocket.open}")
             
             # START ASYNC PINGING IMMEDIATELY
+            logger.debug(f"🎯 Starting ping manager for {request_id}")
             ping_task = await ping_manager.start_pinging(websocket, request_id, 25)
-            if not ping_task:
+            
+            if ping_task:
+                logger.info(f"✅ Ping task started for {request_id}")
+                logger.debug(f"  • Task name: {ping_task.get_name()}")
+                logger.debug(f"  • Task state: {'running' if not ping_task.done() else 'done'}")
+            else:
                 logger.error("❌ Failed to start pinging!")
+                ping_tracker.add_event(request_id, "WS_ERROR", "Failed to start ping task", success=False)
             
             # Check cache first
             if cache_key in gemini_cache:
                 cached_time, response = gemini_cache[cache_key]
                 if datetime.now() - cached_time < timedelta(seconds=CACHE_DURATION):
                     logger.info(f"⚡ Cache hit for {request_id}")
+                    # Mark as inactive since we're returning cached response
+                    active_requests[request_id] = False
                     return f"[{tier} - Cached] {response}"
             
             # Get model configuration
@@ -367,11 +616,16 @@ class AsyncGeminiProcessor:
             max_tokens = config["tokens"]
             timeouts = config["timeouts"][:PARALLEL_MODEL_TRIES]
             
+            logger.debug(f"🤖 Models to try for {request_id}: {models}")
+            logger.debug(f"  • Max tokens: {max_tokens}")
+            logger.debug(f"  • Timeouts: {timeouts}")
+            
             # Submit models in parallel using ThreadPoolExecutor
             futures = []
             with ThreadPoolExecutor(max_workers=PARALLEL_MODEL_TRIES) as model_executor:
                 for i, model in enumerate(models):
                     timeout = timeouts[i] if i < len(timeouts) else 10
+                    logger.debug(f"  • Submitting {model} with timeout {timeout}s")
                     future = model_executor.submit(
                         AsyncGeminiProcessor.call_gemini_sync,
                         query, model, max_tokens, timeout
@@ -381,32 +635,48 @@ class AsyncGeminiProcessor:
                 # Wait for first successful response
                 for model, future in futures:
                     try:
+                        logger.debug(f"  • Waiting for {model} result...")
                         result, success = future.result(timeout=15)
                         if success and result:
-                            logger.info(f"✅ {model} succeeded!")
+                            logger.info(f"✅ {model} succeeded for {request_id}!")
                             gemini_cache[cache_key] = (datetime.now(), result)
+                            # Mark as inactive before returning
+                            active_requests[request_id] = False
                             return f"[{tier} - {model}] {result}"
+                        else:
+                            logger.debug(f"  • {model} failed or no result")
                     except Exception as e:
-                        logger.warning(f"⚠️ {model} failed: {e}")
+                        logger.warning(f"⚠️ {model} failed for {request_id}: {e}")
             
             # Fallback sequential
-            logger.warning("⚠️ Parallel failed, trying sequential")
+            logger.warning(f"⚠️ Parallel failed for {request_id}, trying sequential")
             for model in models:
+                logger.debug(f"  • Trying {model} sequentially...")
                 result, success = AsyncGeminiProcessor.call_gemini_sync(
                     query, model, max_tokens, 10
                 )
                 if success and result:
+                    logger.info(f"✅ {model} succeeded (sequential) for {request_id}!")
                     gemini_cache[cache_key] = (datetime.now(), result)
+                    # Mark as inactive before returning
+                    active_requests[request_id] = False
                     return f"[{tier} - {model}*] {result}"
             
+            logger.error(f"❌ All models failed for {request_id}")
+            # Mark as inactive before returning
+            active_requests[request_id] = False
             return "Sorry, I couldn't generate a response. Please try again."
             
         except Exception as e:
-            logger.error(f"❌ Processing error: {e}")
+            logger.error(f"❌ Processing error for {request_id}: {e}")
+            # Mark as inactive on error
+            active_requests[request_id] = False
             return f"Error: {str(e)[:50]}"
         finally:
-            # Mark request as completed
-            active_requests[request_id] = False
+            # Double-check cleanup
+            if request_id in active_requests:
+                active_requests[request_id] = False
+                logger.debug(f"🔒 Final cleanup: marked {request_id} as inactive")
 
 # ================= FAST TOOLS =================
 def google_search_fast(query: str, max_results: int = 5) -> str:
@@ -510,7 +780,7 @@ class AsyncMCPHandler:
                 "capabilities": {"tools": {}},
                 "serverInfo": {
                     "name": "async-ping-mcp",
-                    "version": "3.6.1-ASYNC-PING"
+                    "version": "3.6.1-ASYNC-PING-DEBUG"
                 }
             }
         }
@@ -574,15 +844,25 @@ class AsyncMCPHandler:
         
         try:
             logger.info(f"🔄 Processing {tool_name}: '{query[:30]}...' [ID: {request_id}]")
+            logger.debug(f"  • WebSocket ID: {id(websocket)}")
+            logger.debug(f"  • WebSocket open: {websocket.open}")
+            logger.debug(f"  • Params: {params}")
             
             if tool_name == "google_search":
+                logger.debug(f"  • Using Google Search")
                 result = google_search_fast(query)
             elif tool_name == "wikipedia_search":
+                logger.debug(f"  • Using Wikipedia Search")
                 result = wikipedia_search_fast(query)
             elif tool_name == "ask_ai":
+                logger.debug(f"  • Using AI with async pings")
                 # Get classification
+                logger.debug(f"  • Classifying query...")
                 tier = SmartModelSelector.classify_query_with_gemini(query)
                 cache_key = hashlib.md5(f"{query}_{tier}".encode()).hexdigest()
+                
+                logger.debug(f"  • Classification: {tier}")
+                logger.debug(f"  • Cache key: {cache_key}")
                 
                 # Process with async pinging
                 result = await AsyncGeminiProcessor.process_query_async(
@@ -592,6 +872,7 @@ class AsyncMCPHandler:
                 result = f"Unknown tool: {tool_name}"
             
             logger.info(f"✅ Completed {tool_name} [ID: {request_id}]")
+            logger.debug(f"  • Result length: {len(result)} chars")
             
             return {
                 "jsonrpc": "2.0",
@@ -601,17 +882,22 @@ class AsyncMCPHandler:
             
         except Exception as e:
             logger.error(f"❌ Tool error [ID: {request_id}]: {e}")
+            # Ensure cleanup on error
+            if request_id in active_requests:
+                active_requests[request_id] = False
             return {
                 "jsonrpc": "2.0",
                 "id": message_id,
                 "error": {"code": -32000, "message": f"Error: {str(e)[:50]}"}
             }
         finally:
-            # Clean up ping task
-            if request_id in active_requests:
-                active_requests[request_id] = False
+            # Log final state
+            logger.debug(f"🏁 Final state for {request_id}:")
+            logger.debug(f"  • In active_requests: {request_id in active_requests}")
+            logger.debug(f"  • Active value: {active_requests.get(request_id, 'NOT_FOUND')}")
+            logger.debug(f"  • Ping tasks active: {request_id in ping_manager.active_tasks}")
 
-# ================= FULL FEATURED WEB SERVER =================
+# ================= ENHANCED WEB SERVER WITH PING DEBUGGING =================
 app = Flask(__name__)
 server_start_time = time.time()
 log_buffer = []
@@ -644,10 +930,11 @@ def add_log(level: str, message: str):
         log_buffer.pop(0)
 
 # Initialize logs
-add_log('INFO', '🚀 STARTING ASYNC PING SERVER...')
+add_log('INFO', '🚀 STARTING ASYNC PING SERVER (DEBUG EDITION)...')
 add_log('INFO', f'Gemini API: {"✅ CONFIGURED" if GEMINI_API_KEY else "❌ MISSING"}')
 add_log('INFO', f'First ping delay: {FIRST_PING_DELAY}s')
 add_log('INFO', f'Continuous ping interval: {CONTINUOUS_PING_INTERVAL}s')
+add_log('DEBUG', f'Debug mode: {DEBUG_PING}')
 
 @app.route('/')
 def index():
@@ -655,11 +942,15 @@ def index():
     hours, remainder = divmod(uptime, 3600)
     minutes, seconds = divmod(remainder, 60)
     
+    # Get ping statistics
+    recent_pings = ping_tracker.get_recent_events(10)
+    active_ping_requests = ping_tracker.get_active_requests()
+    
     return render_template_string('''
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Xiaozhi MCP - Async Ping Dashboard</title>
+        <title>Xiaozhi MCP - Async Ping Debug Dashboard</title>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <style>
@@ -684,7 +975,7 @@ def index():
                 max-width: 1400px;
                 margin: 0 auto;
                 display: grid;
-                grid-template-columns: 2fr 1fr;
+                grid-template-columns: 1fr 1fr;
                 gap: 20px;
             }
             
@@ -776,35 +1067,32 @@ def index():
                 transform: translateY(-2px);
             }
             
-            .test-section {
-                display: grid;
-                gap: 10px;
-            }
-            
-            .test-btn {
-                padding: 12px;
-                background: var(--light);
-                border: 2px solid var(--primary);
-                border-radius: 8px;
-                cursor: pointer;
-                text-align: left;
-                transition: all 0.3s;
-            }
-            
-            .test-btn:hover {
-                background: var(--primary);
-                color: white;
-            }
-            
-            .result-display {
+            .ping-debug-section {
+                background: #f8f9fa;
                 padding: 15px;
-                background: var(--light);
                 border-radius: 8px;
                 margin-top: 15px;
-                display: none;
-                white-space: pre-wrap;
-                max-height: 300px;
-                overflow-y: auto;
+            }
+            
+            .ping-event {
+                padding: 8px;
+                margin: 5px 0;
+                background: white;
+                border-left: 4px solid var(--primary);
+                border-radius: 4px;
+                font-size: 12px;
+            }
+            
+            .ping-success {
+                border-left-color: var(--success);
+            }
+            
+            .ping-error {
+                border-left-color: var(--danger);
+            }
+            
+            .ping-warning {
+                border-left-color: var(--warning);
             }
             
             .real-time {
@@ -837,20 +1125,16 @@ def index():
                 cursor: pointer;
             }
             
-            .grid-2col {
+            .grid-full {
                 grid-column: 1 / -1;
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 20px;
             }
             
-            @media (max-width: 1024px) {
-                .dashboard {
-                    grid-template-columns: 1fr;
-                }
-                .grid-2col {
-                    grid-template-columns: 1fr;
-                }
+            .ping-stats {
+                background: var(--light);
+                padding: 10px;
+                border-radius: 8px;
+                margin-top: 10px;
+                font-size: 12px;
             }
             
             .ping-badge {
@@ -863,21 +1147,40 @@ def index():
                 margin-left: 10px;
             }
             
-            .ping-stats {
-                background: var(--light);
-                padding: 10px;
-                border-radius: 8px;
+            table {
+                width: 100%;
+                border-collapse: collapse;
                 margin-top: 10px;
+            }
+            
+            th, td {
+                padding: 8px;
+                text-align: left;
+                border-bottom: 1px solid #ddd;
                 font-size: 12px;
+            }
+            
+            th {
+                background: #f5f5f5;
+            }
+            
+            .toggle-btn {
+                padding: 6px 12px;
+                background: #666;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+                font-size: 11px;
             }
         </style>
     </head>
     <body>
         <div class="dashboard">
             <div class="header">
-                <h1 style="margin:0;color:var(--primary);">🚀 Xiaozhi MCP v3.6.1</h1>
+                <h1 style="margin:0;color:var(--primary);">🚀 Xiaozhi MCP v3.6.1-DEBUG</h1>
                 <p style="color:#666;margin:5px 0 20px 0;">
-                    Async Ping Mode <span class="ping-badge">⚡ 50ms FIRST PING</span>
+                    Async Ping Debug Mode <span class="ping-badge">⚡ 50ms FIRST PING</span>
                 </p>
                 
                 <div class="status-grid">
@@ -886,57 +1189,95 @@ def index():
                         <div class="uptime-display" id="uptime">{{hours}}h {{minutes}}m {{seconds}}s</div>
                     </div>
                     <div class="status-item">
-                        <div style="color:#666;font-size:14px;">Cache Size</div>
-                        <div style="font-size:24px;color:var(--primary);" id="cacheSize">{{cache_size}}</div>
+                        <div style="color:#666;font-size:14px;">Active Pings</div>
+                        <div style="font-size:24px;color:var(--primary);" id="activePings">{{active_pings_count}}</div>
                     </div>
                     <div class="status-item">
-                        <div style="color:#666;font-size:14px;">Active Requests</div>
-                        <div style="font-size:24px;color:var(--primary);" id="activeRequests">{{active_count}}</div>
+                        <div style="color:#666;font-size:14px;">Total Ping Events</div>
+                        <div style="font-size:24px;color:var(--primary);" id="pingEvents">{{ping_events_count}}</div>
                     </div>
                     <div class="status-item">
                         <div style="color:#666;font-size:14px;">Status</div>
-                        <div style="font-size:24px;color:var(--success);">✅ Async Live</div>
+                        <div style="font-size:24px;color:var(--success);">✅ DEBUG ACTIVE</div>
                     </div>
                 </div>
                 
                 <div class="ping-stats">
-                    <div><strong>Ping Configuration:</strong></div>
+                    <div><strong>Debug Configuration:</strong></div>
                     <div>• First ping: {{first_ping_delay}}s (INSTANT!)</div>
                     <div>• Continuous: {{continuous_ping_interval}}s interval</div>
-                    <div>• Parallel models: {{parallel_tries}} simultaneously</div>
-                </div>
-                
-                <div class="real-time">
-                    <div class="pulse"></div>
-                    <span>Async ping system active (NO THREADING ISSUES)</span>
-                    <button class="refresh-btn" onclick="refreshData()">🔄 Refresh</button>
+                    <div>• Debug mode: {{debug_mode}}</div>
+                    <div>• Active requests: {{active_requests_count}}</div>
                 </div>
             </div>
             
             <div class="card">
-                <h3 style="margin-top:0;color:var(--primary);">🔗 Quick Links</h3>
-                <div class="nav-links">
-                    <a href="/health" class="nav-btn" target="_blank">📊 Health Check</a>
-                    <a href="/test-smart/hello" class="nav-btn" target="_blank">🧪 Quick Test</a>
-                    <a href="/logs" class="nav-btn" target="_blank">📋 View Logs</a>
-                    <a href="/stats" class="nav-btn" target="_blank">📈 Statistics</a>
-                    <a href="/api-docs" class="nav-btn" target="_blank">📚 API Docs</a>
+                <h3 style="margin-top:0;color:var(--primary);">📊 Ping Debug Dashboard</h3>
+                <div style="margin:15px 0;">
+                    <button class="toggle-btn" onclick="toggleDebug()">Toggle Debug Mode</button>
+                    <button class="toggle-btn" onclick="clearPingLogs()">Clear Ping Logs</button>
+                    <button class="toggle-btn" onclick="forcePingTest()">Force Ping Test</button>
                 </div>
                 
-                <h3 style="margin-top:25px;color:var(--primary);">⚡ Ping System Info</h3>
-                <div style="background:var(--light);padding:15px;border-radius:8px;">
-                    <div><strong>Version:</strong> 3.6.1-ASYNC-PING</div>
-                    <div><strong>MCP Protocol:</strong> 2024-11-05</div>
-                    <div><strong>First Ping:</strong> ⚡ {{first_ping_delay}}s (GUARANTEED!)</div>
-                    <div><strong>WebSocket:</strong> ✅ Same event loop (thread-safe)</div>
-                    <div><strong>Last Updated:</strong> {{timestamp}}</div>
+                <h4>🎯 Recent Ping Events ({{recent_pings|length}})</h4>
+                <div class="ping-debug-section" style="max-height: 300px; overflow-y: auto;">
+                    {% for ping in recent_pings %}
+                    <div class="ping-event {% if ping.success %}ping-success{% else %}ping-error{% endif %}">
+                        <div style="display:flex;justify-content:space-between;">
+                            <span><strong>{{ping.type}}</strong></span>
+                            <span style="color:#666;font-size:10px;">{{ping.time}}</span>
+                        </div>
+                        <div style="font-size:11px;color:#666;">ID: {{ping.request_id}}</div>
+                        <div style="font-size:11px;">{{ping.details}}</div>
+                        <div style="font-size:10px;color:#999;">
+                            WS: {{'✅' if ping.ws_open else '❌'}} | 
+                            Success: {{'✅' if ping.success else '❌'}}
+                        </div>
+                    </div>
+                    {% endfor %}
                 </div>
             </div>
             
             <div class="card">
+                <h3 style="margin-top:0;color:var(--primary);">🔍 Ping System State</h3>
+                <div style="margin:15px 0;">
+                    <div><strong>Active Ping Tasks:</strong> {{ping_manager_tasks}}</div>
+                    <div><strong>WebSocket Refs:</strong> {{websocket_refs}}</div>
+                    <div><strong>Active Requests Dict:</strong> {{active_requests_dict}}</div>
+                </div>
+                
+                <h4>📈 Ping Performance</h4>
+                <table>
+                    <tr>
+                        <th>Metric</th>
+                        <th>Value</th>
+                        <th>Status</th>
+                    </tr>
+                    <tr>
+                        <td>First Ping Delay</td>
+                        <td>{{first_ping_delay}}s</td>
+                        <td>{% if first_ping_delay <= 0.1 %}✅ Optimal{% else %}⚠️ High{% endif %}</td>
+                    </tr>
+                    <tr>
+                        <td>Continuous Interval</td>
+                        <td>{{continuous_ping_interval}}s</td>
+                        <td>{% if continuous_ping_interval <= 1 %}✅ Optimal{% else %}⚠️ High{% endif %}</td>
+                    </tr>
+                    <tr>
+                        <td>Async Tasks</td>
+                        <td>{{async_task_count}}</td>
+                        <td>{% if async_task_count > 0 %}✅ Running{% else %}❌ Stopped{% endif %}</td>
+                    </tr>
+                </table>
+            </div>
+            
+            <div class="card grid-full">
                 <div style="display:flex;justify-content:space-between;align-items:center;">
-                    <h3 style="margin-top:0;color:var(--primary);">📝 Live Logs</h3>
-                    <button class="refresh-btn" onclick="refreshLogs()">↻ Update Logs</button>
+                    <h3 style="margin-top:0;color:var(--primary);">📝 Live System Logs</h3>
+                    <div>
+                        <button class="refresh-btn" onclick="refreshLogs()">↻ Update Logs</button>
+                        <button class="toggle-btn" onclick="toggleAutoRefresh()">Auto: <span id="autoRefreshStatus">OFF</span></button>
+                    </div>
                 </div>
                 <div class="log-panel" id="logPanel">
                     {% for log in logs %}
@@ -950,92 +1291,65 @@ def index():
             </div>
             
             <div class="card">
-                <h3 style="margin-top:0;color:var(--primary);">🧪 Test Classification</h3>
-                <div class="test-section">
+                <h3 style="margin-top:0;color:var(--primary);">🧪 Quick Tests</h3>
+                <div style="display:grid;gap:10px;">
                     {% for query in test_queries %}
-                    <button class="test-btn" onclick="runTest('{{query}}')">
-                        Test: {{query[:50]}}{% if query|length > 50 %}...{% endif %}
+                    <button class="test-btn" onclick="runTest('{{query}}')" style="padding:10px;background:#f5f5f5;border:1px solid #ddd;border-radius:6px;text-align:left;cursor:pointer;">
+                        Test: {{query[:40]}}{% if query|length > 40 %}...{% endif %}
                     </button>
                     {% endfor %}
-                    
-                    <div style="margin-top:15px;">
-                        <input type="text" id="customQuery" placeholder="Enter custom query..." 
-                               style="width:70%;padding:10px;border:2px solid #ddd;border-radius:6px;">
-                        <button onclick="runCustomTest()" 
-                                style="padding:10px 20px;background:var(--primary);color:white;border:none;border-radius:6px;">
-                            Run Test
-                        </button>
-                    </div>
                 </div>
                 
-                <div id="testResult" class="result-display"></div>
+                <div style="margin-top:15px;">
+                    <input type="text" id="customQuery" placeholder="Custom test query..." 
+                           style="width:70%;padding:10px;border:1px solid #ddd;border-radius:6px;">
+                    <button onclick="runCustomTest()" style="padding:10px 15px;background:var(--primary);color:white;border:none;border-radius:6px;">
+                        Run
+                    </button>
+                </div>
+                
+                <div id="testResult" style="display:none;margin-top:15px;padding:15px;background:#f9f9f9;border-radius:6px;"></div>
             </div>
             
-            <div class="card grid-2col">
-                <div>
-                    <h3 style="margin-top:0;color:var(--primary);">📊 Performance</h3>
-                    <div style="background:var(--light);padding:15px;border-radius:8px;">
-                        <div style="margin:10px 0;">
-                            <div style="display:flex;justify-content:space-between;">
-                                <span>Async Ping System:</span>
-                                <span id="pingStatus" style="color:var(--success);">● ACTIVE</span>
-                            </div>
-                            <div style="height:8px;background:#eee;border-radius:4px;margin:5px 0;">
-                                <div style="width:100%;height:100%;background:var(--success);border-radius:4px;"></div>
-                            </div>
-                        </div>
-                        <div style="margin:10px 0;">
-                            <div style="display:flex;justify-content:space-between;">
-                                <span>WebSocket Connection:</span>
-                                <span id="wsStatus" style="color:var(--success);">● STABLE</span>
-                            </div>
-                            <div style="height:8px;background:#eee;border-radius:4px;margin:5px 0;">
-                                <div style="width:95%;height:100%;background:var(--success);border-radius:4px;"></div>
-                            </div>
-                        </div>
-                    </div>
+            <div class="card">
+                <h3 style="margin-top:0;color:var(--primary);">⚙️ System Controls</h3>
+                <div style="display:grid;gap:10px;grid-template-columns:1fr 1fr;">
+                    <button onclick="clearCache()" style="padding:10px;background:var(--warning);color:white;border:none;border-radius:6px;">
+                        🗑️ Clear Cache
+                    </button>
+                    <button onclick="stopAllPings()" style="padding:10px;background:var(--danger);color:white;border:none;border-radius:6px;">
+                        🛑 Stop All Pings
+                    </button>
+                    <button onclick="runDiagnostics()" style="padding:10px;background:#666;color:white;border:none;border-radius:6px;">
+                        🩺 Run Diagnostics
+                    </button>
+                    <button onclick="refreshAll()" style="padding:10px;background:var(--primary);color:white;border:none;border-radius:6px;">
+                        🔄 Refresh All
+                    </button>
                 </div>
                 
-                <div>
-                    <h3 style="margin-top:0;color:var(--primary);">⚙️ Quick Actions</h3>
-                    <div style="display:grid;gap:10px;">
-                        <button onclick="clearCache()" style="padding:12px;background:var(--warning);color:white;border:none;border-radius:6px;">
-                            🗑️ Clear Cache
-                        </button>
-                        <button onclick="forceReconnect()" style="padding:12px;background:var(--primary);color:white;border:none;border-radius:6px;">
-                            🔄 Reconnect MCP
-                        </button>
-                        <button onclick="runDiagnostics()" style="padding:12px;background:#666;color:white;border:none;border-radius:6px;">
-                            🩺 Run Diagnostics
-                        </button>
+                <div style="margin-top:15px;padding:10px;background:#f5f5f5;border-radius:6px;">
+                    <div><strong>Debug Endpoints:</strong></div>
+                    <div style="font-size:12px;">
+                        <a href="/ping-debug" target="_blank">/ping-debug</a> - Ping debug info<br>
+                        <a href="/ping-stats" target="_blank">/ping-stats</a> - Ping statistics<br>
+                        <a href="/system-state" target="_blank">/system-state</a> - Full system state
                     </div>
                 </div>
             </div>
         </div>
         
         <script>
-            function updateUptime() {
-                fetch('/api/uptime')
+            let autoRefreshInterval = null;
+            
+            function updateDashboard() {
+                fetch('/api/ping-stats')
                     .then(r => r.json())
                     .then(data => {
+                        document.getElementById('activePings').textContent = data.active_pings;
+                        document.getElementById('pingEvents').textContent = data.total_events;
                         document.getElementById('uptime').textContent = 
-                            `${data.hours}h ${data.minutes}m ${data.seconds}s`;
-                    });
-            }
-            
-            function updateActiveRequests() {
-                fetch('/api/active-requests')
-                    .then(r => r.json())
-                    .then(data => {
-                        document.getElementById('activeRequests').textContent = data.count;
-                    });
-            }
-            
-            function updateCacheSize() {
-                fetch('/api/stats')
-                    .then(r => r.json())
-                    .then(data => {
-                        document.getElementById('cacheSize').textContent = data.cache_size;
+                            `${data.uptime.hours}h ${data.uptime.minutes}m ${data.uptime.seconds}s`;
                     });
             }
             
@@ -1055,28 +1369,88 @@ def index():
                     });
             }
             
+            function refreshPingEvents() {
+                fetch('/api/ping-events')
+                    .then(r => r.json())
+                    .then(events => {
+                        // Update ping events display
+                        const eventsContainer = document.querySelector('.ping-debug-section');
+                        if (eventsContainer) {
+                            eventsContainer.innerHTML = events.map(ping => `
+                                <div class="ping-event ${ping.success ? 'ping-success' : 'ping-error'}">
+                                    <div style="display:flex;justify-content:space-between;">
+                                        <span><strong>${ping.type}</strong></span>
+                                        <span style="color:#666;font-size:10px;">${ping.time}</span>
+                                    </div>
+                                    <div style="font-size:11px;color:#666;">ID: ${ping.request_id}</div>
+                                    <div style="font-size:11px;">${ping.details}</div>
+                                    <div style="font-size:10px;color:#999;">
+                                        WS: ${ping.ws_open ? '✅' : '❌'} | 
+                                        Success: ${ping.success ? '✅' : '❌'}
+                                    </div>
+                                </div>
+                            `).join('');
+                        }
+                    });
+            }
+            
+            function toggleDebug() {
+                fetch('/api/toggle-debug', { method: 'POST' })
+                    .then(r => r.json())
+                    .then(data => {
+                        alert(`Debug mode: ${data.debug_mode ? 'ON' : 'OFF'}`);
+                        location.reload();
+                    });
+            }
+            
+            function clearPingLogs() {
+                if (confirm('Clear all ping debug logs?')) {
+                    fetch('/api/clear-ping-logs', { method: 'POST' })
+                        .then(r => r.json())
+                        .then(data => {
+                            alert('Ping logs cleared!');
+                            refreshPingEvents();
+                        });
+                }
+            }
+            
+            function forcePingTest() {
+                fetch('/api/test-ping', { method: 'POST' })
+                    .then(r => r.json())
+                    .then(data => {
+                        alert(`Ping test initiated: ${data.message}`);
+                        setTimeout(refreshPingEvents, 1000);
+                    });
+            }
+            
+            function stopAllPings() {
+                if (confirm('Stop all active ping tasks?')) {
+                    fetch('/api/stop-pings', { method: 'POST' })
+                        .then(r => r.json())
+                        .then(data => {
+                            alert(`Stopped ${data.stopped} ping tasks`);
+                            updateDashboard();
+                        });
+                }
+            }
+            
             function runTest(query) {
-                const resultDiv = document.getElementById('testResult');
-                resultDiv.style.display = 'block';
-                resultDiv.innerHTML = `<div style="color:var(--warning);">⏳ Testing: "${query}" (Async ping mode)...</div>`;
-                
                 fetch('/test-smart/' + encodeURIComponent(query))
                     .then(r => r.json())
                     .then(data => {
+                        const resultDiv = document.getElementById('testResult');
+                        resultDiv.style.display = 'block';
                         resultDiv.innerHTML = `
                             <div style="color:var(--success);margin-bottom:10px;">✅ Test Complete</div>
                             <div><strong>Query:</strong> ${data.query}</div>
-                            <div><strong>Result:</strong></div>
-                            <div style="margin-top:10px;background:white;padding:10px;border-radius:6px;border:1px solid #ddd;">
-                                ${data.result.replace(/\n/g, '<br>')}
-                            </div>
+                            <div><strong>Result:</strong> ${data.result}</div>
                             <div style="margin-top:10px;color:#666;font-size:12px;">
-                                Cache: ${data.cache_size} items | ${data.timestamp}
+                                ${data.timestamp}
                             </div>
                         `;
                     })
                     .catch(err => {
-                        resultDiv.innerHTML = `<div style="color:var(--danger);">❌ Error: ${err}</div>`;
+                        alert('Test error: ' + err);
                     });
             }
             
@@ -1085,49 +1459,36 @@ def index():
                 if (query) runTest(query);
             }
             
-            function refreshData() {
-                updateUptime();
-                updateActiveRequests();
-                updateCacheSize();
-                refreshLogs();
-            }
-            
-            function clearCache() {
-                if (confirm('Clear all cached responses?')) {
-                    fetch('/api/clear-cache', { method: 'POST' })
-                        .then(r => r.json())
-                        .then(data => {
-                            alert('Cache cleared successfully!');
-                        });
+            function toggleAutoRefresh() {
+                const statusSpan = document.getElementById('autoRefreshStatus');
+                if (autoRefreshInterval) {
+                    clearInterval(autoRefreshInterval);
+                    autoRefreshInterval = null;
+                    statusSpan.textContent = 'OFF';
+                } else {
+                    autoRefreshInterval = setInterval(() => {
+                        updateDashboard();
+                        refreshPingEvents();
+                    }, 2000);
+                    statusSpan.textContent = 'ON';
                 }
             }
             
-            function forceReconnect() {
-                fetch('/api/reconnect', { method: 'POST' })
-                    .then(r => r.json())
-                    .then(data => {
-                        alert('Reconnection initiated');
-                    });
+            function refreshAll() {
+                updateDashboard();
+                refreshLogs();
+                refreshPingEvents();
             }
             
-            function runDiagnostics() {
-                fetch('/api/diagnostics')
-                    .then(r => r.json())
-                    .then(data => {
-                        alert(`Diagnostics complete:\n\n${JSON.stringify(data, null, 2)}`);
-                    });
-            }
+            // Initial setup
+            updateDashboard();
+            setInterval(updateDashboard, 3000);
             
-            // Fast refresh rates
-            setInterval(updateUptime, 1000);
-            setInterval(updateActiveRequests, 1000);
-            setInterval(updateCacheSize, 2000);
-            setInterval(refreshLogs, 3000);
+            // Auto-refresh logs every 5 seconds
+            setInterval(refreshLogs, 5000);
             
-            // Initial load
-            updateUptime();
-            updateActiveRequests();
-            updateCacheSize();
+            // Auto-refresh ping events every 3 seconds
+            setInterval(refreshPingEvents, 3000);
         </script>
     </body>
     </html>
@@ -1135,14 +1496,149 @@ def index():
     hours=hours, 
     minutes=minutes, 
     seconds=seconds,
-    cache_size=len(gemini_cache),
-    active_count=len(active_requests),
-    logs=log_buffer[-20:],
-    test_queries=test_queries,
-    timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+    active_pings_count=len(ping_tracker.get_active_requests()),
+    ping_events_count=len(ping_tracker.events),
+    recent_pings=recent_pings,
+    active_requests_count=len(active_requests),
+    ping_manager_tasks=len(ping_manager.active_tasks),
+    websocket_refs=len(ping_manager.websocket_refs),
+    active_requests_dict=str(list(active_requests.keys())),
     first_ping_delay=FIRST_PING_DELAY,
     continuous_ping_interval=CONTINUOUS_PING_INTERVAL,
-    parallel_tries=PARALLEL_MODEL_TRIES)
+    debug_mode=DEBUG_PING,
+    logs=log_buffer[-20:],
+    test_queries=test_queries,
+    async_task_count=len(ping_manager.active_tasks))
+
+# ================= DEBUG ENDPOINTS =================
+@app.route('/ping-debug')
+def ping_debug():
+    """Debug endpoint for ping system."""
+    recent_events = ping_tracker.get_recent_events(50)
+    active_requests_list = ping_tracker.get_active_requests()
+    
+    return jsonify({
+        "debug_mode": DEBUG_PING,
+        "ping_config": {
+            "first_ping_delay": FIRST_PING_DELAY,
+            "continuous_interval": CONTINUOUS_PING_INTERVAL,
+            "async_mode": ASYNC_PING_MODE
+        },
+        "statistics": {
+            "total_events": len(ping_tracker.events),
+            "active_requests": len(active_requests_list),
+            "request_stats": len(ping_tracker.request_stats),
+            "cleaned_old": ping_tracker.clear_old_requests()
+        },
+        "recent_events": recent_events,
+        "active_requests": active_requests_list,
+        "ping_manager_state": {
+            "active_tasks": len(ping_manager.active_tasks),
+            "websocket_refs": len(ping_manager.websocket_refs),
+            "task_names": list(ping_manager.active_tasks.keys())
+        },
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/ping-stats')
+def ping_stats():
+    """Ping statistics endpoint."""
+    return jsonify({
+        "active_pings": len(ping_tracker.get_active_requests()),
+        "total_events": len(ping_tracker.events),
+        "uptime": {
+            "hours": int((time.time() - server_start_time) // 3600),
+            "minutes": int((time.time() - server_start_time) % 3600 // 60),
+            "seconds": int((time.time() - server_start_time) % 60)
+        },
+        "config": {
+            "first_ping_delay": FIRST_PING_DELAY,
+            "continuous_interval": CONTINUOUS_PING_INTERVAL
+        }
+    })
+
+@app.route('/system-state')
+def system_state():
+    """Full system state endpoint."""
+    return jsonify({
+        "server": {
+            "uptime": time.time() - server_start_time,
+            "version": "3.6.1-DEBUG",
+            "timestamp": datetime.now().isoformat()
+        },
+        "ping_system": {
+            "debug_mode": DEBUG_PING,
+            "active_tasks": len(ping_manager.active_tasks),
+            "active_requests": len(active_requests),
+            "recent_events_count": len(ping_tracker.events),
+            "request_stats_count": len(ping_tracker.request_stats)
+        },
+        "cache": {
+            "size": len(gemini_cache),
+            "duration_seconds": CACHE_DURATION
+        },
+        "connections": {
+            "xiaozhi_ws": "CONFIGURED" if XIAOZHI_WS else "MISSING",
+            "gemini_key": "CONFIGURED" if GEMINI_API_KEY else "MISSING",
+            "google_key": "CONFIGURED" if GOOGLE_API_KEY else "MISSING"
+        }
+    })
+
+@app.route('/api/ping-stats')
+def api_ping_stats():
+    """API endpoint for ping statistics."""
+    uptime = int(time.time() - server_start_time)
+    return jsonify({
+        'active_pings': len(ping_tracker.get_active_requests()),
+        'total_events': len(ping_tracker.events),
+        'uptime': {
+            'hours': uptime // 3600,
+            'minutes': (uptime % 3600) // 60,
+            'seconds': uptime % 60
+        }
+    })
+
+@app.route('/api/ping-events')
+def api_ping_events():
+    """API endpoint for recent ping events."""
+    return jsonify(ping_tracker.get_recent_events(20))
+
+@app.route('/api/logs')
+def api_logs():
+    """API endpoint for system logs."""
+    return jsonify(log_buffer[-30:])
+
+@app.route('/api/toggle-debug', methods=['POST'])
+def api_toggle_debug():
+    """Toggle debug mode."""
+    global DEBUG_PING
+    DEBUG_PING = not DEBUG_PING
+    add_log('INFO', f'Debug mode {"enabled" if DEBUG_PING else "disabled"}')
+    return jsonify({'debug_mode': DEBUG_PING})
+
+@app.route('/api/clear-ping-logs', methods=['POST'])
+def api_clear_ping_logs():
+    """Clear ping debug logs."""
+    old_count = len(ping_tracker.events)
+    ping_tracker.events.clear()
+    add_log('INFO', f'Cleared {old_count} ping debug logs')
+    return jsonify({'cleared': old_count})
+
+@app.route('/api/test-ping', methods=['POST'])
+def api_test_ping():
+    """Test ping system."""
+    test_id = f"test_{uuid.uuid4().hex[:8]}"
+    ping_tracker.add_event(test_id, "TEST_PING", "Manual ping test triggered", success=True)
+    add_log('INFO', f'Ping test triggered: {test_id}')
+    return jsonify({'message': f'Ping test {test_id} triggered', 'test_id': test_id})
+
+@app.route('/api/stop-pings', methods=['POST'])
+def api_stop_pings():
+    """Stop all ping tasks."""
+    stopped = len(ping_manager.active_tasks)
+    ping_manager.stop_all_pings()
+    add_log('INFO', f'Stopped {stopped} ping tasks')
+    return jsonify({'stopped': stopped})
 
 @app.route('/health')
 def health_check():
@@ -1151,159 +1647,18 @@ def health_check():
     add_log('INFO', 'Health check accessed')
     
     return jsonify({
-        "status": "async_ping_healthy",
-        "version": "3.6.1-ASYNC-PING",
+        "status": "async_ping_debug_healthy",
+        "version": "3.6.1-DEBUG",
         "uptime": f"{uptime // 3600}h {(uptime % 3600) // 60}m {uptime % 60}s",
         "cache_size": len(gemini_cache),
         "active_requests": len(active_requests),
-        "ping_config": {
-            "first_ping_delay": FIRST_PING_DELAY,
-            "continuous_interval": CONTINUOUS_PING_INTERVAL,
-            "async_mode": True
+        "ping_debug": {
+            "enabled": DEBUG_PING,
+            "events_count": len(ping_tracker.events),
+            "active_pings": len(ping_tracker.get_active_requests())
         },
         "timestamp": datetime.now().isoformat()
     })
-
-@app.route('/logs')
-def view_logs():
-    """View all logs."""
-    return render_template_string('''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>System Logs - Xiaozhi MCP</title>
-        <meta charset="utf-8">
-        <style>
-            body { font-family: monospace; margin: 20px; background: #1a1a1a; color: #fff; }
-            .log-entry { padding: 5px 0; border-bottom: 1px solid #333; }
-            .time { color: #888; margin-right: 15px; }
-            .INFO { color: #4CAF50; }
-            .WARNING { color: #FF9800; }
-            .ERROR { color: #F44336; }
-            .DEBUG { color: #2196F3; }
-            h1 { color: #4285F4; }
-            .back-btn { 
-                background: #4285F4; color: white; padding: 10px 20px; 
-                text-decoration: none; border-radius: 6px; margin-bottom: 20px; display: inline-block;
-            }
-        </style>
-    </head>
-    <body>
-        <a href="/" class="back-btn">← Back to Dashboard</a>
-        <h1>📋 System Logs ({{ logs|length }} entries)</h1>
-        {% for log in logs %}
-        <div class="log-entry">
-            <span class="time">[{{ log.time }}]</span>
-            <span class="{{ log.level }}"><strong>{{ log.level }}</strong></span>
-            <span>{{ log.message }}</span>
-        </div>
-        {% endfor %}
-        <script>
-            window.scrollTo(0, document.body.scrollHeight);
-        </script>
-    </body>
-    </html>
-    ''', logs=log_buffer)
-
-@app.route('/stats')
-def statistics():
-    """Statistics endpoint."""
-    add_log('INFO', 'Statistics page accessed')
-    
-    return jsonify({
-        "cache_size": len(gemini_cache),
-        "active_requests": len(active_requests),
-        "log_count": len(log_buffer),
-        "server_time": datetime.now().isoformat()
-    })
-
-@app.route('/api-docs')
-def api_docs():
-    """API documentation."""
-    return render_template_string('''
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>API Documentation - Xiaozhi MCP</title>
-        <meta charset="utf-8">
-        <style>
-            body { font-family: -apple-system, sans-serif; max-width: 800px; margin: 40px auto; padding: 20px; }
-            h1, h2 { color: #4285F4; }
-            .endpoint { background: #f5f5f5; padding: 15px; margin: 15px 0; border-radius: 8px; }
-            code { background: #333; color: #fff; padding: 2px 6px; border-radius: 4px; }
-            .method { font-weight: bold; color: #34A853; }
-            .back-btn { 
-                background: #4285F4; color: white; padding: 10px 20px; 
-                text-decoration: none; border-radius: 6px; margin-bottom: 20px; display: inline-block;
-            }
-        </style>
-    </head>
-    <body>
-        <a href="/" class="back-btn">← Back to Dashboard</a>
-        <h1>📚 API Documentation</h1>
-        
-        <h2>🔗 Available Endpoints</h2>
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/</code> - Main dashboard with real-time monitoring
-        </div>
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/health</code> - System health check (JSON)
-        </div>
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/logs</code> - View system logs
-        </div>
-        <div class="endpoint">
-            <div class="method">GET</div>
-            <code>/stats</code> - Statistics (JSON)
-        </div>
-        
-        <h2>🔧 MCP Protocol with Async Pings</h2>
-        <p>The server implements Model Context Protocol (MCP) over WebSocket with ASYNC pinging:</p>
-        <ul>
-            <li><strong>Tools:</strong> google_search, wikipedia_search, ask_ai</li>
-            <li><strong>Protocol Version:</strong> 2024-11-05</li>
-            <li><strong>Async Pings:</strong> ⚡ 50ms first ping guaranteed</li>
-            <li><strong>Thread-Safe:</strong> ✅ WebSocket in same event loop</li>
-            <li><strong>Prevents:</strong> Xiaozhi 5-8s timeout completely</li>
-        </ul>
-    </body>
-    </html>
-    ''')
-
-@app.route('/api/uptime')
-def api_uptime():
-    uptime = int(time.time() - server_start_time)
-    hours, remainder = divmod(uptime, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    return jsonify({
-        'hours': hours,
-        'minutes': minutes,
-        'seconds': seconds
-    })
-
-@app.route('/api/logs')
-def api_logs():
-    return jsonify(log_buffer[-30:])
-
-@app.route('/api/stats')
-def api_stats():
-    return jsonify({
-        'cache_size': len(gemini_cache),
-        'active_requests': len(active_requests)
-    })
-
-@app.route('/api/active-requests')
-def api_active_requests():
-    return jsonify({'count': len(active_requests)})
-
-@app.route('/api/clear-cache', methods=['POST'])
-def api_clear_cache():
-    gemini_cache.clear()
-    add_log('INFO', 'Cache cleared via API')
-    return jsonify({'status': 'success', 'message': 'Cache cleared'})
 
 @app.route('/test-smart/<path:query>')
 def test_smart(query):
@@ -1335,7 +1690,11 @@ async def async_mcp_bridge():
     
     while True:
         try:
-            logger.info("🔗 Connecting to Xiaozhi (Async Ping Mode)...")
+            logger.info("🔗 Connecting to Xiaozhi (Async Ping Debug Mode)...")
+            add_log('INFO', f'Connecting to Xiaozhi WebSocket')
+            logger.debug(f"  • WebSocket URL: {XIAOZHI_WS[:50]}...")
+            logger.debug(f"  • Reconnect delay: {reconnect_delay}s")
+            
             async with websockets.connect(
                 XIAOZHI_WS,
                 ping_interval=15,
@@ -1343,7 +1702,10 @@ async def async_mcp_bridge():
                 close_timeout=5
             ) as websocket:
                 logger.info("✅ CONNECTED TO XIAOZHI")
-                add_log('INFO', 'Connected to Xiaozhi (Async Ping)')
+                add_log('INFO', 'Connected to Xiaozhi (Async Ping Debug)')
+                logger.debug(f"  • WebSocket ID: {id(websocket)}")
+                logger.debug(f"  • WebSocket open: {websocket.open}")
+                
                 reconnect_delay = 1
                 
                 async for raw_message in websocket:
@@ -1353,60 +1715,94 @@ async def async_mcp_bridge():
                         method = data.get("method", "")
                         params = data.get("params", {})
                         
+                        logger.debug(f"📨 Received MCP message: {method}")
+                        logger.debug(f"  • Message ID: {message_id}")
+                        logger.debug(f"  • Params keys: {list(params.keys())}")
+                        
                         response = None
                         
                         if method == "ping":
+                            logger.debug("  • Handling ping request")
                             response = AsyncMCPHandler.handle_ping(message_id)
                         elif method == "initialize":
+                            logger.debug("  • Handling initialize request")
                             response = AsyncMCPHandler.handle_initialize(message_id)
-                            add_log('INFO', 'MCP Initialized (Async Ping)')
+                            add_log('INFO', 'MCP Initialized (Async Ping Debug)')
                         elif method == "tools/list":
+                            logger.debug("  • Handling tools/list request")
                             response = AsyncMCPHandler.handle_tools_list(message_id)
                         elif method == "tools/call":
+                            tool_name = params.get("name", "")
+                            logger.debug(f"  • Handling tools/call: {tool_name}")
                             response = await AsyncMCPHandler.handle_tools_call_async(
                                 message_id, params, websocket
                             )
-                            tool_name = params.get("name", "")
                             if tool_name == "ask_ai":
-                                add_log('INFO', 'AI processed with async pings')
+                                add_log('INFO', 'AI processed with async pings (debug)')
                         else:
+                            logger.warning(f"  • Unknown method: {method}")
                             response = {"jsonrpc": "2.0", "id": message_id, "error": {"code": -32601, "message": "Unknown method"}}
                         
                         if response:
+                            logger.debug(f"📤 Sending response for message {message_id}")
                             await websocket.send(json.dumps(response))
+                            logger.debug(f"  • Response sent successfully")
                             
+                    except json.JSONDecodeError as e:
+                        error_msg = f'JSON decode error: {str(e)[:30]}'
+                        logger.error(f"❌ {error_msg}")
+                        add_log('ERROR', error_msg)
                     except Exception as e:
-                        add_log('ERROR', f'Message error: {str(e)[:30]}')
+                        error_msg = f'Message processing error: {str(e)[:30]}'
+                        logger.error(f"❌ {error_msg}")
+                        add_log('ERROR', error_msg)
                         
+        except websockets.exceptions.ConnectionClosed as e:
+            error_msg = f"WebSocket connection closed: {e.code} - {e.reason}"
+            logger.error(f"❌ {error_msg}")
+            add_log('ERROR', error_msg)
+        except ConnectionRefusedError as e:
+            error_msg = f"Connection refused: {str(e)}"
+            logger.error(f"❌ {error_msg}")
+            add_log('ERROR', error_msg)
         except Exception as e:
             error_msg = f"Connection error: {str(e)[:50]}"
             logger.error(f"❌ {error_msg}")
             add_log('ERROR', error_msg)
             
             # Clean up all ping tasks
+            logger.debug("🧹 Cleaning up ping tasks due to connection error")
             ping_manager.stop_all_pings()
             active_requests.clear()
             
             logger.info(f"🔄 Reconnecting in {reconnect_delay}s...")
+            add_log('INFO', f'Reconnecting in {reconnect_delay}s')
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 1.5, 5)
 
 async def main():
     logger.info("""
-    ╔══════════════════════════════════════════════════╗
-    ║           🚀 ASYNC PING MCP v3.6.1              ║
-    ║         NO THREADING • SAME EVENT LOOP          ║
-    ║          50ms FIRST PING GUARANTEED             ║
-    ╚══════════════════════════════════════════════════╝
-    """)
+    ╔══════════════════════════════════════════════════════╗
+    ║           🚀 ASYNC PING MCP v3.6.1-DEBUG            ║
+    ║            COMPREHENSIVE DEBUG ENABLED              ║
+    ║           PING TRACKING: {} EVENTS                ║
+    ╚══════════════════════════════════════════════════════╝
+    """.format(len(ping_tracker.events)))
     
-    add_log('INFO', '🚀 Starting Async Ping Server...')
+    add_log('INFO', '🚀 Starting Async Ping Debug Server...')
+    add_log('DEBUG', f'First ping delay: {FIRST_PING_DELAY}s')
+    add_log('DEBUG', f'Continuous interval: {CONTINUOUS_PING_INTERVAL}s')
+    add_log('DEBUG', f'Parallel model tries: {PARALLEL_MODEL_TRIES}')
     
     # Start web server
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
+    logger.info("🌐 Web server started on port 3000")
+    logger.debug("  • Thread ID: {}".format(web_thread.ident))
+    logger.debug("  • Thread alive: {}".format(web_thread.is_alive()))
     
     # Start MCP bridge
+    logger.info("🔗 Starting MCP bridge with debug ping tracking...")
     await async_mcp_bridge()
 
 if __name__ == "__main__":
@@ -1415,6 +1811,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("\n👋 Server stopped by user")
         add_log('INFO', 'Server stopped by user')
+        ping_manager.stop_all_pings()
     except Exception as e:
         logger.error(f"💥 Fatal error: {e}")
         add_log('ERROR', f'Fatal: {str(e)[:50]}')
+        ping_manager.stop_all_pings()
