@@ -1,11 +1,11 @@
-# main.py - XIAOZHI MCP SERVER v3.6.2 - UNLIMITED LOGS WITH UTC+8
+# main.py - XIAOZHI MCP SERVER v3.6.2 - UNLIMITED LOGS WITH UTC+8 (FIXED)
 import os
 import asyncio
 import json
 import websockets
 import requests
 import logging
-from flask import Flask, jsonify, render_template_string, Response
+from flask import Flask, jsonify, render_template_string, Response, request
 import threading
 import time
 import sys
@@ -243,16 +243,22 @@ class UnlimitedEventTracker:
     def add_websocket_event(self, event_type: str, details: str, 
                            websocket_id: str = None, data: Dict = None):
         """Add WebSocket-specific event"""
+        # Determine success based on event type
+        is_success = event_type not in ['ERROR', 'CLOSED', 'FAILED', 'CONNECTION_ERROR', 
+                                       'CONNECTION_REFUSED', 'JSON_ERROR', 'MESSAGE_ERROR',
+                                       'UNKNOWN_METHOD']
+        
         return self.add_event(
             event_type=f"WS_{event_type}",
             source=f"ws_{websocket_id or 'unknown'}",
             details=details,
             data=data or {},
-            success=event_type not in ['ERROR', 'CLOSED', 'FAILED']
+            success=is_success
         )
     
     def add_ai_event(self, event_type: str, details: str, request_id: str = None, 
-                    model: str = None, tier: str = None):
+                    model: str = None, tier: str = None, success: bool = False, 
+                    duration_ms: float = 0.0, data: Dict = None):
         """Add AI processing event"""
         return self.add_event(
             event_type=f"AI_{event_type}",
@@ -262,19 +268,22 @@ class UnlimitedEventTracker:
                 'request_id': request_id,
                 'model': model,
                 'tier': tier,
-                'cache_size': len(gemini_cache)
+                'cache_size': len(gemini_cache),
+                **(data or {})
             },
-            success=event_type not in ['ERROR', 'FAILED', 'TIMEOUT']
+            success=success,
+            duration_ms=duration_ms
         )
     
-    def add_system_event(self, event_type: str, details: str, data: Dict = None):
+    def add_system_event(self, event_type: str, details: str, data: Dict = None, 
+                        success: bool = True):
         """Add system-level event"""
         return self.add_event(
             event_type=f"SYS_{event_type}",
             source="system",
             details=details,
             data=data or {},
-            success=True
+            success=success
         )
     
     def _get_ping_count(self, request_id: str) -> int:
@@ -940,7 +949,8 @@ class AsyncPingManager:
         event_tracker.add_system_event(
             "PING_STOP_COMPLETE",
             f"All ping tasks stopped: {stopped_count} tasks in {stop_duration:.1f}ms",
-            {'stopped_count': stopped_count, 'duration_ms': stop_duration}
+            {'stopped_count': stopped_count, 'duration_ms': stop_duration},
+            success=True
         )
         
         logger.info(f"✅ [STOP_ALL] All ping tasks stopped ({stopped_count} tasks in {stop_duration:.1f}ms)")
@@ -966,7 +976,8 @@ class SmartModelSelector:
         event_tracker.add_ai_event(
             "CLASSIFY_START",
             f"Starting classification for query: {query[:50]}...",
-            model="gemini-2.5-flash-lite"
+            model="gemini-2.5-flash-lite",
+            success=True
         )
         
         logger.info(f"🎯 [CLASSIFY] Starting classification: '{query[:50]}...'")
@@ -1007,7 +1018,8 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             event_tracker.add_ai_event(
                 "CLASSIFY_REQUEST",
                 f"Sending classification request to Gemini",
-                model="gemini-2.5-flash-lite"
+                model="gemini-2.5-flash-lite",
+                success=True
             )
             
             logger.debug(f"📤 [CLASSIFY] Sending request to Gemini API")
@@ -1043,6 +1055,8 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
                                     f"Classification complete: {tier}",
                                     tier=tier,
                                     model="gemini-2.5-flash-lite",
+                                    success=True,
+                                    duration_ms=total_time,
                                     data={
                                         'response_time_ms': response_time,
                                         'total_time_ms': total_time,
@@ -1077,7 +1091,8 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             event_tracker.add_ai_event(
                 "CLASSIFY_TIMEOUT",
                 "Classification timeout after 3 seconds",
-                success=False
+                success=False,
+                duration_ms=total_time
             )
             
             logger.warning(f"⏰ [CLASSIFY] Classification timeout, using MEDIUM")
@@ -1090,7 +1105,8 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             event_tracker.add_ai_event(
                 "CLASSIFY_ERROR",
                 f"Classification error: {e}",
-                success=False
+                success=False,
+                duration_ms=total_time
             )
             
             logger.error(f"❌ [CLASSIFY] Classification error: {e}")
@@ -1134,6 +1150,7 @@ class AsyncGeminiProcessor:
             "API_CALL_START",
             f"Starting Gemini API call: {model}",
             model=model,
+            success=True,
             data={
                 'call_id': call_id,
                 'query_length': len(query),
@@ -1278,6 +1295,7 @@ class AsyncGeminiProcessor:
             f"Starting AI processing: {tier} tier",
             request_id=request_id,
             tier=tier,
+            success=True,
             data={
                 'query': query[:100],
                 'cache_key': cache_key,
@@ -1303,6 +1321,7 @@ class AsyncGeminiProcessor:
                 f"Request marked as active",
                 request_id=request_id,
                 tier=tier,
+                success=True,
                 data={'active_requests_count': len(active_requests)}
             )
             
@@ -1316,7 +1335,8 @@ class AsyncGeminiProcessor:
                 "PING_START",
                 f"Starting async ping manager",
                 request_id=request_id,
-                tier=tier
+                tier=tier,
+                success=True
             )
             
             ping_task = await ping_manager.start_pinging(websocket, request_id, 25)
@@ -1374,13 +1394,15 @@ class AsyncGeminiProcessor:
                     # Mark as inactive since we're returning cached response
                     active_requests[request_id] = False
                     
+                    process_time = (get_utc8_time() - process_start).total_seconds() * 1000
+                    
                     event_tracker.add_ai_event(
                         "PROCESS_COMPLETE",
                         f"Process completed with cache hit",
                         request_id=request_id,
                         tier=tier,
                         success=True,
-                        duration_ms=(get_utc8_time() - process_start).total_seconds() * 1000
+                        duration_ms=process_time
                     )
                     
                     return f"[{tier} - Cached] {response}"
@@ -1396,6 +1418,7 @@ class AsyncGeminiProcessor:
                 f"Model configuration loaded",
                 request_id=request_id,
                 tier=tier,
+                success=True,
                 data={
                     'models': models,
                     'max_tokens': max_tokens,
@@ -1421,6 +1444,7 @@ class AsyncGeminiProcessor:
                         request_id=request_id,
                         tier=tier,
                         model=model,
+                        success=True,
                         data={'timeout': timeout}
                     )
                     
@@ -1439,7 +1463,8 @@ class AsyncGeminiProcessor:
                             f"Waiting for model result: {model}",
                             request_id=request_id,
                             tier=tier,
-                            model=model
+                            model=model,
+                            success=True
                         )
                         
                         logger.debug(f"   • [AI_PROCESS] Waiting for {model} result...")
@@ -1468,6 +1493,7 @@ class AsyncGeminiProcessor:
                                 request_id=request_id,
                                 tier=tier,
                                 model=model,
+                                success=True,
                                 data={
                                     'cache_size': len(gemini_cache),
                                     'response_length': len(result)
@@ -1535,7 +1561,8 @@ class AsyncGeminiProcessor:
                     f"Trying model sequentially: {model}",
                     request_id=request_id,
                     tier=tier,
-                    model=model
+                    model=model,
+                    success=True
                 )
                 
                 logger.debug(f"   • [AI_PROCESS] Trying {model} sequentially...")
@@ -1631,7 +1658,8 @@ class AsyncGeminiProcessor:
                     "FINAL_CLEANUP",
                     f"Final cleanup: marked request as inactive",
                     request_id=request_id,
-                    tier=tier
+                    tier=tier,
+                    success=True
                 )
                 
                 logger.debug(f"🔒 [AI_PROCESS] Final cleanup: marked {request_id} as inactive")
@@ -2141,6 +2169,7 @@ class AsyncMCPHandler:
                 "MCP_FINAL_STATE",
                 f"Final state for request {request_id}",
                 request_id=request_id,
+                success=True,
                 data={
                     'in_active_requests': request_id in active_requests,
                     'active_value': active_requests.get(request_id, 'NOT_FOUND'),
@@ -2183,7 +2212,7 @@ def index():
                 --primary: #4285F4;
                 --success: #34A853;
                 --warning: #FBBC05;
-                --danger: #EA4335;
+                --danger: #F44336;
                 --dark: #202124;
                 --light: #f8f9fa;
             }
@@ -2925,26 +2954,6 @@ def health_check():
         "timestamp": format_utc8_time()
     })
 
-# ================= LOG STREAMING ENDPOINT =================
-@app.route('/api/logs/stream')
-def stream_logs():
-    """Stream logs in real-time (Server-Sent Events)"""
-    def generate():
-        last_count = 0
-        
-        while True:
-            current_count = unlimited_handler.count()
-            
-            if current_count > last_count:
-                new_logs = unlimited_handler.get_all_logs()[last_count:current_count]
-                for log in new_logs:
-                    yield f"data: {json.dumps(log)}\n\n"
-                last_count = current_count
-            
-            time.sleep(0.1)  # Small delay to prevent CPU overuse
-    
-    return Response(generate(), mimetype='text/event-stream')
-
 # ================= ASYNC MCP BRIDGE WITH DETAILED LOGGING =================
 async def async_mcp_bridge():
     """Async WebSocket bridge with detailed logging."""
@@ -3061,8 +3070,7 @@ async def async_mcp_bridge():
                             event_tracker.add_websocket_event(
                                 "UNKNOWN_METHOD",
                                 f"Unknown MCP method: {method}",
-                                websocket_id=str(websocket_id),
-                                success=False
+                                websocket_id=str(websocket_id)
                             )
                             
                             response = {"jsonrpc": "2.0", "id": message_id, "error": {"code": -32601, "message": "Unknown method"}}
@@ -3079,12 +3087,11 @@ async def async_mcp_bridge():
                                 "MESSAGE_SENT",
                                 f"Sent response for {method}",
                                 websocket_id=str(websocket_id),
-                                success=True,
-                                duration_ms=send_duration,
                                 data={
                                     'message_id': message_id,
                                     'method': method,
-                                    'response_length': len(json.dumps(response))
+                                    'response_length': len(json.dumps(response)),
+                                    'send_duration_ms': send_duration
                                 }
                             )
                             
@@ -3098,8 +3105,7 @@ async def async_mcp_bridge():
                         event_tracker.add_websocket_event(
                             "JSON_ERROR",
                             f"JSON decode error: {str(e)[:50]}",
-                            websocket_id=str(websocket_id),
-                            success=False
+                            websocket_id=str(websocket_id)
                         )
                         
                         logger.error(f"❌ [MCP_BRIDGE] JSON decode error: {e}")
@@ -3112,8 +3118,7 @@ async def async_mcp_bridge():
                         event_tracker.add_websocket_event(
                             "MESSAGE_ERROR",
                             f"Message processing error: {str(e)[:50]}",
-                            websocket_id=str(websocket_id),
-                            success=False
+                            websocket_id=str(websocket_id)
                         )
                         
                         logger.error(f"❌ [MCP_BRIDGE] Message processing error: {e}")
@@ -3126,7 +3131,6 @@ async def async_mcp_bridge():
             event_tracker.add_websocket_event(
                 "CONNECTION_CLOSED",
                 f"WebSocket connection closed: {e.code} - {e.reason}",
-                success=False,
                 data={'close_code': e.code, 'close_reason': e.reason}
             )
             
@@ -3140,8 +3144,7 @@ async def async_mcp_bridge():
             
             event_tracker.add_websocket_event(
                 "CONNECTION_REFUSED",
-                f"Connection refused: {str(e)}",
-                success=False
+                f"Connection refused: {str(e)}"
             )
             
             logger.error(f"❌ [MCP_BRIDGE] Connection refused: {e}")
@@ -3152,8 +3155,7 @@ async def async_mcp_bridge():
             
             event_tracker.add_websocket_event(
                 "CONNECTION_ERROR",
-                f"Connection error: {str(e)[:50]}",
-                success=False
+                f"Connection error: {str(e)[:50]}"
             )
             
             logger.error(f"❌ [MCP_BRIDGE] Connection error: {e}")
