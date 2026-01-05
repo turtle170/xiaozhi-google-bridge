@@ -10,15 +10,13 @@ import threading
 import time
 import sys
 from dotenv import load_dotenv
-import re
 import hashlib
 from datetime import datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 import uuid
-from typing import Dict, List, Deque
-from dataclasses import dataclass, asdict
+from typing import Dict, Deque
+from dataclasses import dataclass
 from collections import deque
-import html
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 load_dotenv()
@@ -55,14 +53,14 @@ def format_utc8_time_short(dt=None):
     return dt.strftime('%H:%M:%S.%f')[:-3]
 
 # ================= UNLIMITED LOGGING CONFIGURATION =================
-UNLIMITED_LOGS = True  # No maximum log length
-DEBUG_PING = True  # Enable detailed ping debugging
-LOG_STREAM_ENABLED = True  # Enable live log streaming
+UNLIMITED_LOGS = True
+DEBUG_PING = True
+LOG_STREAM_ENABLED = True
 
 # ================= ASYNC PING CONFIGURATION =================
 ASYNC_PING_MODE = True
-FIRST_PING_DELAY = 0.05  # 50ms - INSTANT first ping!
-CONTINUOUS_PING_INTERVAL = 0.8  # 0.8 seconds
+FIRST_PING_DELAY = 0.05
+CONTINUOUS_PING_INTERVAL = 0.8
 PARALLEL_MODEL_TRIES = 3
 MAX_WORKERS = 5
 
@@ -81,10 +79,8 @@ class UnlimitedMemoryHandler(logging.Handler):
     def emit(self, record):
         """Store log record with UTC+8 timestamp"""
         try:
-            # Format the record
             msg = self.format(record)
             
-            # Create log entry with UTC+8 time
             log_entry = {
                 'timestamp': get_utc8_time(),
                 'formatted_time': format_utc8_time_short(),
@@ -97,7 +93,6 @@ class UnlimitedMemoryHandler(logging.Handler):
                 'process': record.processName or str(record.process)
             }
             
-            # Add to unlimited log storage
             self.logs.append(log_entry)
             
         except Exception as e:
@@ -125,17 +120,14 @@ class UnlimitedMemoryHandler(logging.Handler):
 
 # Setup unlimited logging
 logger = logging.getLogger('xiaozhi_mcp')
-logger.setLevel(logging.DEBUG)  # Set to DEBUG to capture EVERYTHING
+logger.setLevel(logging.DEBUG)
 
-# Remove any existing handlers
 logger.handlers.clear()
 
-# Create and add unlimited memory handler
 unlimited_handler = UnlimitedMemoryHandler()
 unlimited_handler.setLevel(logging.DEBUG)
 logger.addHandler(unlimited_handler)
 
-# Also add console handler for real-time viewing
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
 console_formatter = logging.Formatter(
@@ -151,8 +143,8 @@ CACHE_DURATION = 300
 active_requests: Dict[str, bool] = {}
 ping_tasks: Dict[str, asyncio.Task] = {}
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
-all_ping_events: Deque[Dict] = deque()  # Unlimited ping events storage
-all_web_socket_events: Deque[Dict] = deque()  # Unlimited WebSocket events
+all_ping_events: Deque[Dict] = deque()
+all_web_socket_events: Deque[Dict] = deque()
 
 keep_alive_messages = [
     "AI is thinking... 🧠",
@@ -219,7 +211,6 @@ class UnlimitedEventTracker:
         
         self.events.append(event)
         
-        # Log to unlimited logger
         status = "✅" if success else "❌"
         logger.debug(f"{status} [{event_type}] {source}: {details}")
         
@@ -243,7 +234,6 @@ class UnlimitedEventTracker:
     def add_websocket_event(self, event_type: str, details: str, 
                            websocket_id: str = None, data: Dict = None):
         """Add WebSocket-specific event"""
-        # Determine success based on event type
         is_success = event_type not in ['ERROR', 'CLOSED', 'FAILED', 'CONNECTION_ERROR', 
                                        'CONNECTION_REFUSED', 'JSON_ERROR', 'MESSAGE_ERROR',
                                        'UNKNOWN_METHOD']
@@ -260,17 +250,21 @@ class UnlimitedEventTracker:
                     model: str = None, tier: str = None, success: bool = False, 
                     duration_ms: float = 0.0, data: Dict = None):
         """Add AI processing event"""
+        event_data = data or {}
+        if request_id:
+            event_data['request_id'] = request_id
+        if model:
+            event_data['model'] = model
+        if tier:
+            event_data['tier'] = tier
+        
+        event_data['cache_size'] = len(gemini_cache)
+        
         return self.add_event(
             event_type=f"AI_{event_type}",
             source=f"ai_{request_id or 'unknown'}",
             details=details,
-            data={
-                'request_id': request_id,
-                'model': model,
-                'tier': tier,
-                'cache_size': len(gemini_cache),
-                **(data or {})
-            },
+            data=event_data,
             success=success,
             duration_ms=duration_ms
         )
@@ -328,15 +322,12 @@ class UnlimitedEventTracker:
         by_success = {'success': 0, 'failed': 0}
         
         for event in self.events:
-            # Count by type
             event_type = event.event_type.split('_')[0] if '_' in event.event_type else event.event_type
             by_type[event_type] = by_type.get(event_type, 0) + 1
             
-            # Count by source
             source = event.source.split('_')[0] if '_' in event.source else event.source
             by_source[source] = by_source.get(source, 0) + 1
             
-            # Count by success
             if event.success:
                 by_success['success'] += 1
             else:
@@ -372,7 +363,6 @@ class AsyncPingManager:
         self.ping_counters: Dict[str, int] = {}
         self.start_times: Dict[str, datetime] = {}
         
-        # Log initialization
         event_tracker.add_system_event(
             "INIT",
             "AsyncPingManager initialized",
@@ -385,7 +375,6 @@ class AsyncPingManager:
         start_time = get_utc8_time()
         
         try:
-            # PHASE 1: Detailed parameter validation
             event_tracker.add_ping_event(
                 request_id, "VALIDATE", 
                 f"Validating ping start parameters",
@@ -394,9 +383,6 @@ class AsyncPingManager:
             )
             
             logger.debug(f"🔍 [PING_START] Validating parameters for {request_id}")
-            logger.debug(f"   • WebSocket: {'Present' if websocket else 'Missing'}")
-            logger.debug(f"   • WebSocket ID: {id(websocket)}")
-            logger.debug(f"   • Has 'open' attr: {hasattr(websocket, 'open')}")
             
             if not websocket:
                 error_msg = "No WebSocket provided"
@@ -408,11 +394,8 @@ class AsyncPingManager:
                 logger.error(f"❌ [PING_START] {error_msg} for {request_id}")
                 return None
             
-            # Store initial state
             self.start_times[request_id] = start_time
             self.ping_counters[request_id] = 0
-            
-            # Store WebSocket reference
             self.websocket_refs[request_id] = websocket
             
             event_tracker.add_ping_event(
@@ -423,20 +406,13 @@ class AsyncPingManager:
             )
             
             logger.info(f"🚀 [PING_START] Starting async ping for {request_id}")
-            logger.debug(f"   • Duration: {duration}s")
-            logger.debug(f"   • First ping delay: {FIRST_PING_DELAY}s")
-            logger.debug(f"   • Continuous interval: {CONTINUOUS_PING_INTERVAL}s")
-            logger.debug(f"   • WebSocket open: {websocket.open}")
-            logger.debug(f"   • Active tasks: {len(self.active_tasks)}")
             
-            # Create and store ping task
             task = asyncio.create_task(
                 self._ping_worker(websocket, request_id, duration),
                 name=f"ping_{request_id}"
             )
             self.active_tasks[request_id] = task
             
-            # Add done callback for cleanup
             task.add_done_callback(lambda t: self._cleanup(request_id))
             
             event_tracker.add_ping_event(
@@ -446,11 +422,6 @@ class AsyncPingManager:
             )
             
             logger.info(f"✅ [PING_START] Async ping started for {request_id}")
-            logger.debug(f"   • Task name: {task.get_name()}")
-            logger.debug(f"   • Task done: {task.done()}")
-            logger.debug(f"   • Task cancelled: {task.cancelled()}")
-            logger.debug(f"   • Event loop: {asyncio.get_running_loop()}")
-            
             return task
             
         except Exception as e:
@@ -477,16 +448,10 @@ class AsyncPingManager:
         )
         
         logger.info(f"📡 [PING_WORKER] Worker started for {request_id}")
-        logger.debug(f"   • Start time: {format_utc8_time(start_time)}")
-        logger.debug(f"   • Duration: {duration}s")
-        logger.debug(f"   • WebSocket ID: {id(websocket)}")
-        logger.debug(f"   • Event loop: {asyncio.get_running_loop()}")
         
         try:
-            # PHASE 1: INSTANT FIRST PING (50ms)
             logger.debug(f"⏳ [PING_WORKER] Waiting {FIRST_PING_DELAY}s for first ping...")
             
-            # Log waiting start
             event_tracker.add_ping_event(
                 request_id, "WAIT_FIRST", 
                 f"Waiting {FIRST_PING_DELAY}s before first ping",
@@ -496,7 +461,6 @@ class AsyncPingManager:
             
             await asyncio.sleep(FIRST_PING_DELAY)
             
-            # Log waiting complete
             waited_time = (get_utc8_time() - start_time).total_seconds()
             event_tracker.add_ping_event(
                 request_id, "WAIT_COMPLETE", 
@@ -507,7 +471,6 @@ class AsyncPingManager:
             
             logger.debug(f"✅ [PING_WORKER] First ping wait complete ({waited_time:.3f}s)")
             
-            # Send first ping
             logger.debug(f"📤 [PING_WORKER] Sending first ping...")
             first_ping_success = await self._send_safe_ping(websocket, request_id, ping_count, is_first=True)
             
@@ -523,8 +486,6 @@ class AsyncPingManager:
                 )
                 
                 logger.info(f"✅ [PING_WORKER] INSTANT PING #1 sent for {request_id} (after {waited_time:.3f}s)")
-                logger.debug(f"   • Ping count: {ping_count}")
-                logger.debug(f"   • WebSocket still open: {websocket.open}")
             else:
                 event_tracker.add_ping_event(
                     request_id, "FIRST_FAILED", 
@@ -535,7 +496,6 @@ class AsyncPingManager:
                 
                 logger.warning(f"⚠️ [PING_WORKER] Failed to send first ping for {request_id}")
             
-            # PHASE 2: CONTINUOUS PINGS (0.8s interval)
             last_ping_time = get_utc8_time()
             continuous_start = get_utc8_time()
             
@@ -547,13 +507,10 @@ class AsyncPingManager:
             )
             
             logger.info(f"🔄 [PING_WORKER] Starting continuous pings for {request_id}")
-            logger.debug(f"   • Interval: {CONTINUOUS_PING_INTERVAL}s")
-            logger.debug(f"   • Target duration: {duration}s")
             
             while (get_utc8_time() - start_time).total_seconds() < duration:
                 loop_start = get_utc8_time()
                 
-                # Check if request is still active
                 if not self._is_request_active(request_id):
                     event_tracker.add_ping_event(
                         request_id, "REQUEST_COMPLETE", 
@@ -563,7 +520,6 @@ class AsyncPingManager:
                     logger.info(f"⚠️ [PING_WORKER] Request {request_id} completed, stopping pings")
                     break
                 
-                # Check if WebSocket is still connected
                 if not websocket.open:
                     event_tracker.add_ping_event(
                         request_id, "WS_CLOSED", 
@@ -574,7 +530,6 @@ class AsyncPingManager:
                     logger.warning(f"⚠️ [PING_WORKER] WebSocket closed for {request_id}, stopping pings")
                     break
                 
-                # Calculate sleep time
                 elapsed_since_last = (get_utc8_time() - last_ping_time).total_seconds()
                 sleep_time = max(0, CONTINUOUS_PING_INTERVAL - elapsed_since_last)
                 
@@ -589,7 +544,6 @@ class AsyncPingManager:
                     logger.debug(f"💤 [PING_WORKER] Sleeping {sleep_time:.3f}s before next ping")
                     await asyncio.sleep(sleep_time)
                 
-                # Send ping
                 logger.debug(f"📤 [PING_WORKER] Sending continuous ping #{ping_count + 1}...")
                 success = await self._send_safe_ping(websocket, request_id, ping_count, is_first=False)
                 last_ping_time = get_utc8_time()
@@ -605,25 +559,17 @@ class AsyncPingManager:
                         success=True
                     )
                     
-                    # Log every ping
                     elapsed_total = (get_utc8_time() - start_time).total_seconds()
                     logger.debug(f"📤 [PING_WORKER] Ping #{ping_count} sent (elapsed: {elapsed_total:.1f}s)")
                     
-                    # Info log every 5 pings
                     if ping_count % 5 == 0:
                         logger.info(f"📤 [PING_WORKER] Ping #{ping_count} sent for {request_id} (elapsed: {elapsed_total:.1f}s)")
                 
-                # Calculate loop duration
                 loop_duration = (get_utc8_time() - loop_start).total_seconds()
                 
-                # Log detailed loop info every 10 loops
                 if ping_count % 10 == 0 and ping_count > 0:
                     logger.debug(f"📊 [PING_WORKER] Loop #{ping_count} took {loop_duration:.3f}s")
-                    logger.debug(f"   • Total elapsed: {(get_utc8_time() - start_time).total_seconds():.1f}s")
-                    logger.debug(f"   • WebSocket open: {websocket.open}")
-                    logger.debug(f"   • Request active: {self._is_request_active(request_id)}")
                 
-                # Check if we should continue
                 total_elapsed = (get_utc8_time() - start_time).total_seconds()
                 if total_elapsed >= duration:
                     event_tracker.add_ping_event(
@@ -634,7 +580,6 @@ class AsyncPingManager:
                     logger.debug(f"⏰ [PING_WORKER] Duration reached for {request_id}")
                     break
             
-            # Worker completion
             total_duration = (get_utc8_time() - start_time).total_seconds()
             continuous_duration = (get_utc8_time() - continuous_start).total_seconds()
             
@@ -646,10 +591,6 @@ class AsyncPingManager:
             )
             
             logger.info(f"✅ [PING_WORKER] Ping worker completed for {request_id}")
-            logger.debug(f"   • Total pings: {ping_count}")
-            logger.debug(f"   • Total duration: {total_duration:.1f}s")
-            logger.debug(f"   • Continuous duration: {continuous_duration:.1f}s")
-            logger.debug(f"   • Average interval: {continuous_duration/max(1, ping_count-1):.3f}s")
             
         except asyncio.CancelledError:
             cancelled_time = get_utc8_time()
@@ -662,8 +603,6 @@ class AsyncPingManager:
             )
             
             logger.info(f"🛑 [PING_WORKER] Ping worker CANCELLED for {request_id}")
-            logger.debug(f"   • Duration before cancel: {duration_before_cancel:.1f}s")
-            logger.debug(f"   • Pings sent before cancel: {ping_count}")
             raise
             
         except Exception as e:
@@ -677,8 +616,6 @@ class AsyncPingManager:
             )
             
             logger.error(f"❌ [PING_WORKER] Ping worker error for {request_id}")
-            logger.debug(f"   • Duration before error: {duration_before_error:.1f}s")
-            logger.debug(f"   • Pings sent before error: {ping_count}")
             logger.exception("Detailed error trace:")
             
         finally:
@@ -690,11 +627,7 @@ class AsyncPingManager:
         ping_number = ping_count + 1
         
         try:
-            # Detailed WebSocket state checking
             logger.debug(f"🔍 [PING_SEND] Checking WebSocket state for {request_id}")
-            logger.debug(f"   • Ping number: {ping_number}")
-            logger.debug(f"   • Is first: {is_first}")
-            logger.debug(f"   • WebSocket object: {'Present' if websocket else 'Missing'}")
             
             if not websocket:
                 event_tracker.add_ping_event(
@@ -727,7 +660,6 @@ class AsyncPingManager:
                 logger.warning(f"⚠️ [PING_SEND] WebSocket not open for {request_id}")
                 return False
             
-            # Prepare ping message
             message_idx = ping_count % len(keep_alive_messages)
             ping_type = "FIRST" if is_first else f"#{ping_number}"
             
@@ -742,7 +674,6 @@ class AsyncPingManager:
                 }
             }
             
-            # Log message preparation
             event_tracker.add_ping_event(
                 request_id, "PREPARE", 
                 f"Preparing ping message: {ping_message['params']['progress']['text']}",
@@ -751,16 +682,11 @@ class AsyncPingManager:
             )
             
             logger.debug(f"📨 [PING_SEND] Preparing ping for {request_id}")
-            logger.debug(f"   • Message: {ping_message['params']['progress']['text']}")
-            logger.debug(f"   • WebSocket ID: {id(websocket)}")
-            logger.debug(f"   • Is open: {websocket.open}")
             
-            # Send the ping
             send_start_inner = time.time()
             await websocket.send(json.dumps(ping_message))
             send_duration = (time.time() - send_start_inner) * 1000
             
-            # Log success
             total_duration = (get_utc8_time() - send_start).total_seconds() * 1000
             
             event_tracker.add_ping_event(
@@ -771,10 +697,6 @@ class AsyncPingManager:
             )
             
             logger.debug(f"✅ [PING_SEND] Ping sent successfully for {request_id}")
-            logger.debug(f"   • Send duration: {send_duration:.1f}ms")
-            logger.debug(f"   • Total duration: {total_duration:.1f}ms")
-            logger.debug(f"   • Ping type: {ping_type}")
-            
             return True
             
         except websockets.exceptions.ConnectionClosed as e:
@@ -788,9 +710,6 @@ class AsyncPingManager:
             )
             
             logger.warning(f"⚠️ [PING_SEND] Connection closed while pinging {request_id}")
-            logger.debug(f"   • Close code: {e.code}")
-            logger.debug(f"   • Reason: {e.reason}")
-            logger.debug(f"   • Duration before close: {close_duration:.1f}ms")
             return False
             
         except websockets.exceptions.WebSocketException as e:
@@ -803,7 +722,6 @@ class AsyncPingManager:
             )
             
             logger.error(f"❌ [PING_SEND] WebSocket exception for {request_id}: {e}")
-            logger.debug(f"   • Duration before error: {error_duration:.1f}ms")
             return False
             
         except Exception as e:
@@ -816,7 +734,6 @@ class AsyncPingManager:
             )
             
             logger.error(f"❌ [PING_SEND] Unexpected error sending ping for {request_id}: {e}")
-            logger.debug(f"   • Duration before error: {error_duration:.1f}ms")
             logger.exception("Detailed error trace:")
             return False
     
@@ -824,7 +741,6 @@ class AsyncPingManager:
         """Check if request is still active."""
         is_active = request_id in active_requests and active_requests[request_id]
         
-        # Log active check periodically
         if request_id in self.ping_counters and self.ping_counters[request_id] % 10 == 0:
             logger.debug(f"🔍 [ACTIVE_CHECK] Request {request_id}: {is_active}")
         
@@ -837,14 +753,12 @@ class AsyncPingManager:
         try:
             logger.debug(f"🧹 [CLEANUP] Starting cleanup for {request_id}")
             
-            # Record cleanup start
             event_tracker.add_ping_event(
                 request_id, "CLEANUP_START", 
                 "Starting cleanup process",
                 success=True
             )
             
-            # Cancel task if still running
             if request_id in self.active_tasks:
                 task = self.active_tasks[request_id]
                 
@@ -863,17 +777,14 @@ class AsyncPingManager:
                 del self.active_tasks[request_id]
                 logger.debug(f"   • [CLEANUP] Task removed from active_tasks: {request_id}")
             
-            # Remove WebSocket reference
             if request_id in self.websocket_refs:
                 del self.websocket_refs[request_id]
                 logger.debug(f"   • [CLEANUP] WebSocket reference removed: {request_id}")
             
-            # Remove from active requests
             if request_id in active_requests:
                 del active_requests[request_id]
                 logger.debug(f"   • [CLEANUP] Removed from active_requests: {request_id}")
             
-            # Remove counters and timers
             if request_id in self.ping_counters:
                 final_count = self.ping_counters[request_id]
                 del self.ping_counters[request_id]
@@ -885,7 +796,6 @@ class AsyncPingManager:
                 del self.start_times[request_id]
                 logger.debug(f"   • [CLEANUP] Removed start time: duration was {duration:.1f}s")
             
-            # Record cleanup completion
             cleanup_duration = (get_utc8_time() - cleanup_start).total_seconds() * 1000
             
             event_tracker.add_ping_event(
@@ -895,7 +805,6 @@ class AsyncPingManager:
             )
             
             logger.info(f"🧹 [CLEANUP] Cleaned up ping manager for {request_id}")
-            logger.debug(f"   • Cleanup duration: {cleanup_duration:.1f}ms")
             
         except Exception as e:
             error_duration = (get_utc8_time() - cleanup_start).total_seconds() * 1000
@@ -907,7 +816,6 @@ class AsyncPingManager:
             )
             
             logger.error(f"❌ [CLEANUP] Cleanup error for {request_id}: {e}")
-            logger.debug(f"   • Duration before error: {error_duration:.1f}ms")
     
     def stop_all_pings(self):
         """Stop all ping tasks with detailed logging."""
@@ -1023,17 +931,12 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             )
             
             logger.debug(f"📤 [CLASSIFY] Sending request to Gemini API")
-            logger.debug(f"   • URL: {url}")
-            logger.debug(f"   • Query length: {len(query)} chars")
-            logger.debug(f"   • Prompt length: {len(classification_prompt)} chars")
             
             response_start = time.time()
             response = requests.post(url, headers=headers, json=data, params=params, timeout=3)
             response_time = (time.time() - response_start) * 1000
             
             logger.debug(f"📥 [CLASSIFY] Response received in {response_time:.1f}ms")
-            logger.debug(f"   • Status code: {response.status_code}")
-            logger.debug(f"   • Response length: {len(response.text)} chars")
             
             response.raise_for_status()
             
@@ -1065,13 +968,8 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
                                 )
                                 
                                 logger.info(f"✅ [CLASSIFY] Classified as {tier}")
-                                logger.debug(f"   • Raw response: {classification}")
-                                logger.debug(f"   • Response time: {response_time:.1f}ms")
-                                logger.debug(f"   • Total time: {total_time:.1f}ms")
-                                
                                 return tier
             
-            # Default classification
             total_time = (get_utc8_time() - start_time).total_seconds() * 1000
             
             event_tracker.add_ai_event(
@@ -1082,7 +980,6 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             )
             
             logger.warning(f"⚠️ [CLASSIFY] No valid classification found, using MEDIUM")
-            logger.debug(f"   • Total time: {total_time:.1f}ms")
             return "MEDIUM"
             
         except requests.exceptions.Timeout:
@@ -1096,7 +993,6 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             )
             
             logger.warning(f"⏰ [CLASSIFY] Classification timeout, using MEDIUM")
-            logger.debug(f"   • Timeout after: {total_time:.1f}ms")
             return "MEDIUM"
             
         except Exception as e:
@@ -1110,7 +1006,6 @@ Strictly only say "HARD", "MEDIUM", OR "SIMPLE", no extra text, no explanation."
             )
             
             logger.error(f"❌ [CLASSIFY] Classification error: {e}")
-            logger.debug(f"   • Error time: {total_time:.1f}ms")
             logger.exception("Detailed error trace:")
             return "MEDIUM"
 
@@ -1160,10 +1055,6 @@ class AsyncGeminiProcessor:
         )
         
         logger.debug(f"📞 [GEMINI_CALL] Starting API call: {model}")
-        logger.debug(f"   • Call ID: {call_id}")
-        logger.debug(f"   • Query: '{query[:50]}...'")
-        logger.debug(f"   • Max tokens: {max_tokens}")
-        logger.debug(f"   • Timeout: {timeout}s")
         
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -1189,8 +1080,6 @@ class AsyncGeminiProcessor:
             request_time = (time.time() - request_start) * 1000
             
             logger.debug(f"📥 [GEMINI_CALL] Response received in {request_time:.1f}ms")
-            logger.debug(f"   • Status code: {response.status_code}")
-            logger.debug(f"   • Response size: {len(response.text)} chars")
             
             if response.status_code == 200:
                 result = response.json()
@@ -1218,13 +1107,8 @@ class AsyncGeminiProcessor:
                             )
                             
                             logger.info(f"✅ [GEMINI_CALL] {model} succeeded")
-                            logger.debug(f"   • Response length: {len(text)} chars")
-                            logger.debug(f"   • Request time: {request_time:.1f}ms")
-                            logger.debug(f"   • Total time: {total_time:.1f}ms")
-                            
                             return text, True
             
-            # Non-200 response or no valid result
             total_time = (get_utc8_time() - call_start).total_seconds() * 1000
             
             event_tracker.add_ai_event(
@@ -1241,9 +1125,6 @@ class AsyncGeminiProcessor:
             )
             
             logger.warning(f"⚠️ [GEMINI_CALL] {model} failed with status {response.status_code}")
-            logger.debug(f"   • Request time: {request_time:.1f}ms")
-            logger.debug(f"   • Total time: {total_time:.1f}ms")
-            
             return None, False
             
         except requests.exceptions.Timeout:
@@ -1262,7 +1143,6 @@ class AsyncGeminiProcessor:
             )
             
             logger.warning(f"⏰ [GEMINI_CALL] {model} timeout after {timeout}s")
-            logger.debug(f"   • Total time: {total_time:.1f}ms")
             return None, False
             
         except Exception as e:
@@ -1281,7 +1161,6 @@ class AsyncGeminiProcessor:
             )
             
             logger.error(f"❌ [GEMINI_CALL] {model} error: {str(e)[:50]}")
-            logger.debug(f"   • Total time: {total_time:.1f}ms")
             logger.exception("Detailed error trace:")
             return None, False
     
@@ -1304,16 +1183,8 @@ class AsyncGeminiProcessor:
         )
         
         logger.info(f"🚀 [AI_PROCESS] Processing {tier} tier: '{query[:40]}...' [ID: {request_id}]")
-        logger.debug(f"   • Request ID: {request_id}")
-        logger.debug(f"   • Tier: {tier}")
-        logger.debug(f"   • Query: '{query[:100]}...'")
-        logger.debug(f"   • Query length: {len(query)} chars")
-        logger.debug(f"   • Cache key: {cache_key}")
-        logger.debug(f"   • WebSocket ID: {id(websocket)}")
-        logger.debug(f"   • WebSocket open: {websocket.open}")
         
         try:
-            # Mark request as active
             active_requests[request_id] = True
             
             event_tracker.add_ai_event(
@@ -1326,9 +1197,7 @@ class AsyncGeminiProcessor:
             )
             
             logger.debug(f"📝 [AI_PROCESS] Marked {request_id} as active")
-            logger.debug(f"   • Active requests: {list(active_requests.keys())}")
             
-            # START ASYNC PINGING IMMEDIATELY
             logger.debug(f"🎯 [AI_PROCESS] Starting ping manager for {request_id}")
             
             event_tracker.add_ai_event(
@@ -1355,8 +1224,6 @@ class AsyncGeminiProcessor:
                 )
                 
                 logger.info(f"✅ [AI_PROCESS] Ping task started for {request_id}")
-                logger.debug(f"   • Task name: {ping_task.get_name()}")
-                logger.debug(f"   • Task state: {'running' if not ping_task.done() else 'done'}")
             else:
                 event_tracker.add_ai_event(
                     "PING_FAILED",
@@ -1368,7 +1235,6 @@ class AsyncGeminiProcessor:
                 
                 logger.error("❌ [AI_PROCESS] Failed to start pinging!")
             
-            # Check cache first
             if cache_key in gemini_cache:
                 cached_time, response = gemini_cache[cache_key]
                 cache_age = (get_utc8_time() - cached_time).total_seconds()
@@ -1388,10 +1254,7 @@ class AsyncGeminiProcessor:
                     )
                     
                     logger.info(f"⚡ [AI_PROCESS] Cache hit for {request_id}")
-                    logger.debug(f"   • Cache age: {cache_age:.1f}s")
-                    logger.debug(f"   • Response length: {len(response)} chars")
                     
-                    # Mark as inactive since we're returning cached response
                     active_requests[request_id] = False
                     
                     process_time = (get_utc8_time() - process_start).total_seconds() * 1000
@@ -1407,7 +1270,6 @@ class AsyncGeminiProcessor:
                     
                     return f"[{tier} - Cached] {response}"
             
-            # Get model configuration
             config = AsyncGeminiProcessor.get_model_config(tier)
             models = config["models"][:PARALLEL_MODEL_TRIES]
             max_tokens = config["tokens"]
@@ -1428,11 +1290,7 @@ class AsyncGeminiProcessor:
             )
             
             logger.debug(f"🤖 [AI_PROCESS] Models to try for {request_id}: {models}")
-            logger.debug(f"   • Max tokens: {max_tokens}")
-            logger.debug(f"   • Timeouts: {timeouts}")
-            logger.debug(f"   • Parallel tries: {PARALLEL_MODEL_TRIES}")
             
-            # Submit models in parallel using ThreadPoolExecutor
             futures = []
             with ThreadPoolExecutor(max_workers=PARALLEL_MODEL_TRIES) as model_executor:
                 for i, model in enumerate(models):
@@ -1455,7 +1313,6 @@ class AsyncGeminiProcessor:
                     )
                     futures.append((model, future))
                 
-                # Wait for first successful response
                 for model, future in futures:
                     try:
                         event_tracker.add_ai_event(
@@ -1482,9 +1339,7 @@ class AsyncGeminiProcessor:
                             )
                             
                             logger.info(f"✅ [AI_PROCESS] {model} succeeded for {request_id}!")
-                            logger.debug(f"   • Response length: {len(result)} chars")
                             
-                            # Cache the successful response
                             gemini_cache[cache_key] = (get_utc8_time(), result)
                             
                             event_tracker.add_ai_event(
@@ -1500,7 +1355,6 @@ class AsyncGeminiProcessor:
                                 }
                             )
                             
-                            # Mark as inactive before returning
                             active_requests[request_id] = False
                             
                             total_time = (get_utc8_time() - process_start).total_seconds() * 1000
@@ -1516,9 +1370,6 @@ class AsyncGeminiProcessor:
                             )
                             
                             logger.info(f"✅ [AI_PROCESS] Process completed for {request_id} in {total_time:.1f}ms")
-                            logger.debug(f"   • Total time: {total_time:.1f}ms")
-                            logger.debug(f"   • Cache size: {len(gemini_cache)}")
-                            
                             return f"[{tier} - {model}] {result}"
                         else:
                             event_tracker.add_ai_event(
@@ -1544,7 +1395,6 @@ class AsyncGeminiProcessor:
                         
                         logger.warning(f"⚠️ [AI_PROCESS] {model} failed for {request_id}: {e}")
             
-            # Fallback sequential
             event_tracker.add_ai_event(
                 "FALLBACK_START",
                 f"Parallel failed, starting sequential fallback",
@@ -1585,7 +1435,6 @@ class AsyncGeminiProcessor:
                     
                     gemini_cache[cache_key] = (get_utc8_time(), result)
                     
-                    # Mark as inactive before returning
                     active_requests[request_id] = False
                     
                     total_time = (get_utc8_time() - process_start).total_seconds() * 1000
@@ -1602,7 +1451,6 @@ class AsyncGeminiProcessor:
                     
                     return f"[{tier} - {model}*] {result}"
             
-            # All models failed
             event_tracker.add_ai_event(
                 "ALL_MODELS_FAILED",
                 f"All models failed for request",
@@ -1613,7 +1461,6 @@ class AsyncGeminiProcessor:
             
             logger.error(f"❌ [AI_PROCESS] All models failed for {request_id}")
             
-            # Mark as inactive before returning
             active_requests[request_id] = False
             
             total_time = (get_utc8_time() - process_start).total_seconds() * 1000
@@ -1642,15 +1489,12 @@ class AsyncGeminiProcessor:
             )
             
             logger.error(f"❌ [AI_PROCESS] Processing error for {request_id}: {e}")
-            logger.debug(f"   • Error time: {total_time:.1f}ms")
             logger.exception("Detailed error trace:")
             
-            # Mark as inactive on error
             active_requests[request_id] = False
             
             return f"Error: {str(e)[:50]}"
         finally:
-            # Double-check cleanup
             if request_id in active_requests:
                 active_requests[request_id] = False
                 
@@ -1700,16 +1544,12 @@ def google_search_fast(query: str, max_results: int = 5) -> str:
         }
         
         logger.debug(f"📤 [GOOGLE] Sending request to Google API")
-        logger.debug(f"   • URL: {url}")
-        logger.debug(f"   • Query: '{query}'")
-        logger.debug(f"   • Max results: {max_results}")
         
         request_start = time.time()
         response = requests.get(url, params=params, timeout=8)
         request_time = (time.time() - request_start) * 1000
         
         logger.debug(f"📥 [GOOGLE] Response received in {request_time:.1f}ms")
-        logger.debug(f"   • Status code: {response.status_code}")
         
         data = response.json()
         
@@ -1725,9 +1565,6 @@ def google_search_fast(query: str, max_results: int = 5) -> str:
             )
             
             logger.info(f"⚠️ [GOOGLE] No results found for: '{query[:50]}...'")
-            logger.debug(f"   • Request time: {request_time:.1f}ms")
-            logger.debug(f"   • Total time: {total_time:.1f}ms")
-            
             return "No results found."
         
         items = data["items"][:max_results]
@@ -1755,8 +1592,6 @@ def google_search_fast(query: str, max_results: int = 5) -> str:
         )
         
         logger.info(f"✅ [GOOGLE] Search successful: {len(items)} results")
-        logger.debug(f"   • Request time: {request_time:.1f}ms")
-        logger.debug(f"   • Total time: {total_time:.1f}ms")
         
         return result_text
         
@@ -1771,7 +1606,6 @@ def google_search_fast(query: str, max_results: int = 5) -> str:
         )
         
         logger.error(f"❌ [GOOGLE] Google search error: {e}")
-        logger.debug(f"   • Error time: {total_time:.1f}ms")
         logger.exception("Detailed error trace:")
         
         return "Search error."
@@ -1804,15 +1638,12 @@ def wikipedia_search_fast(query: str, max_results: int = 2) -> str:
         }
         
         logger.debug(f"📤 [WIKIPEDIA] Sending search request")
-        logger.debug(f"   • URL: {url}")
-        logger.debug(f"   • Query: '{query}'")
         
         request_start = time.time()
         response = requests.get(url, params=params, timeout=8)
         request_time = (time.time() - request_start) * 1000
         
         logger.debug(f"📥 [WIKIPEDIA] Search response in {request_time:.1f}ms")
-        logger.debug(f"   • Status code: {response.status_code}")
         
         data = response.json()
         
@@ -1887,9 +1718,6 @@ def wikipedia_search_fast(query: str, max_results: int = 2) -> str:
             )
             
             logger.info(f"✅ [WIKIPEDIA] Search successful: '{title}'")
-            logger.debug(f"   • Search time: {request_time:.1f}ms")
-            logger.debug(f"   • Extract time: {extract_time:.1f}ms")
-            logger.debug(f"   • Total time: {total_time:.1f}ms")
             
             return f"**{title}**\n📖 {extract[:200]}..."
         
@@ -1915,7 +1743,6 @@ def wikipedia_search_fast(query: str, max_results: int = 2) -> str:
         )
         
         logger.error(f"❌ [WIKIPEDIA] Wikipedia search error: {e}")
-        logger.debug(f"   • Error time: {total_time:.1f}ms")
         logger.exception("Detailed error trace:")
         
         return "Search error."
@@ -2026,14 +1853,6 @@ class AsyncMCPHandler:
         )
         
         logger.info(f"🔄 [MCP] Processing {tool_name}: '{query[:30]}...' [ID: {request_id}]")
-        logger.debug(f"   • Message ID: {message_id}")
-        logger.debug(f"   • Request ID: {request_id}")
-        logger.debug(f"   • Tool: {tool_name}")
-        logger.debug(f"   • Query: '{query[:100]}...'")
-        logger.debug(f"   • Query length: {len(query)} chars")
-        logger.debug(f"   • WebSocket ID: {id(websocket)}")
-        logger.debug(f"   • WebSocket open: {websocket.open}")
-        logger.debug(f"   • Params keys: {list(params.keys())}")
         
         if not query:
             event_tracker.add_system_event(
@@ -2058,8 +1877,7 @@ class AsyncMCPHandler:
                 event_tracker.add_system_event(
                     "GOOGLE_CALL",
                     f"Calling Google search",
-                    request_id=request_id,
-                    data={'query': query[:100]}
+                    data={'request_id': request_id, 'query': query[:100]}
                 )
                 
                 logger.debug(f"   • [MCP] Using Google Search")
@@ -2069,8 +1887,7 @@ class AsyncMCPHandler:
                 event_tracker.add_system_event(
                     "WIKIPEDIA_CALL",
                     f"Calling Wikipedia search",
-                    request_id=request_id,
-                    data={'query': query[:100]}
+                    data={'request_id': request_id, 'query': query[:100]}
                 )
                 
                 logger.debug(f"   • [MCP] Using Wikipedia Search")
@@ -2080,13 +1897,11 @@ class AsyncMCPHandler:
                 event_tracker.add_system_event(
                     "AI_CALL",
                     f"Calling AI with async pings",
-                    request_id=request_id,
-                    data={'query': query[:100]}
+                    data={'request_id': request_id, 'query': query[:100]}
                 )
                 
                 logger.debug(f"   • [MCP] Using AI with async pings")
                 
-                # Get classification
                 logger.debug(f"   • [MCP] Classifying query...")
                 tier = SmartModelSelector.classify_query_with_gemini(query)
                 cache_key = hashlib.md5(f"{query}_{tier}".encode()).hexdigest()
@@ -2094,7 +1909,6 @@ class AsyncMCPHandler:
                 logger.debug(f"   • [MCP] Classification: {tier}")
                 logger.debug(f"   • [MCP] Cache key: {cache_key}")
                 
-                # Process with async pinging
                 result = await AsyncGeminiProcessor.process_query_async(
                     query, tier, cache_key, websocket, request_id
                 )
@@ -2103,7 +1917,7 @@ class AsyncMCPHandler:
                 event_tracker.add_system_event(
                     "UNKNOWN_TOOL",
                     f"Unknown tool requested: {tool_name}",
-                    request_id=request_id,
+                    data={'request_id': request_id, 'tool_name': tool_name},
                     success=False
                 )
                 
@@ -2114,19 +1928,16 @@ class AsyncMCPHandler:
             event_tracker.add_system_event(
                 "MCP_TOOLS_CALL_COMPLETE",
                 f"MCP tools/call completed: {tool_name}",
-                request_id=request_id,
-                success=True,
-                duration_ms=total_time,
                 data={
+                    'request_id': request_id,
                     'tool_name': tool_name,
                     'result_length': len(result),
                     'total_time_ms': total_time
-                }
+                },
+                success=True
             )
             
             logger.info(f"✅ [MCP] Completed {tool_name} [ID: {request_id}]")
-            logger.debug(f"   • Result length: {len(result)} chars")
-            logger.debug(f"   • Total time: {total_time:.1f}ms")
             
             return {
                 "jsonrpc": "2.0",
@@ -2140,16 +1951,18 @@ class AsyncMCPHandler:
             event_tracker.add_system_event(
                 "MCP_TOOLS_CALL_ERROR",
                 f"Tool error: {str(e)[:100]}",
-                request_id=request_id,
+                data={
+                    'request_id': request_id,
+                    'tool_name': tool_name,
+                    'error': str(e)[:100]
+                },
                 success=False,
                 duration_ms=total_time
             )
             
             logger.error(f"❌ [MCP] Tool error [ID: {request_id}]: {e}")
-            logger.debug(f"   • Error time: {total_time:.1f}ms")
             logger.exception("Detailed error trace:")
             
-            # Ensure cleanup on error
             if request_id in active_requests:
                 active_requests[request_id] = False
             
@@ -2159,22 +1972,18 @@ class AsyncMCPHandler:
                 "error": {"code": -32000, "message": f"Error: {str(e)[:50]}"}
             }
         finally:
-            # Log final state
             logger.debug(f"🏁 [MCP] Final state for {request_id}:")
-            logger.debug(f"   • In active_requests: {request_id in active_requests}")
-            logger.debug(f"   • Active value: {active_requests.get(request_id, 'NOT_FOUND')}")
-            logger.debug(f"   • Ping tasks active: {request_id in ping_manager.active_tasks}")
             
             event_tracker.add_system_event(
                 "MCP_FINAL_STATE",
                 f"Final state for request {request_id}",
-                request_id=request_id,
-                success=True,
                 data={
+                    'request_id': request_id,
                     'in_active_requests': request_id in active_requests,
                     'active_value': active_requests.get(request_id, 'NOT_FOUND'),
                     'in_ping_tasks': request_id in ping_manager.active_tasks
-                }
+                },
+                success=True
             )
 
 # ================= ENHANCED WEB SERVER WITH UNLIMITED LOGS =================
@@ -2195,7 +2004,6 @@ def index():
     hours, remainder = divmod(int(uptime), 3600)
     minutes, seconds = divmod(remainder, 60)
     
-    # Get all logs and events
     all_logs = unlimited_handler.get_all_logs()
     all_events = event_tracker.get_all_events()
     recent_events = event_tracker.get_recent_events(50)
@@ -2559,20 +2367,17 @@ def index():
                         
                         let filteredLogs = logs;
                         
-                        // Apply search filter
                         if (searchTerm) {
                             try {
                                 const regex = new RegExp(searchTerm, 'i');
                                 filteredLogs = logs.filter(log => regex.test(log.message));
                             } catch (e) {
-                                // If regex fails, do simple search
                                 filteredLogs = logs.filter(log => 
                                     log.message.toLowerCase().includes(searchTerm.toLowerCase())
                                 );
                             }
                         }
                         
-                        // Apply level filter
                         if (filter !== 'ALL') {
                             if (filter === 'PING') {
                                 filteredLogs = filteredLogs.filter(log => log.message.includes('[PING_'));
@@ -2587,7 +2392,6 @@ def index():
                             }
                         }
                         
-                        // Limit display if not expanded
                         if (!logsExpanded && filteredLogs.length > 1000) {
                             filteredLogs = filteredLogs.slice(-1000);
                         }
@@ -2600,11 +2404,9 @@ def index():
                             </div>
                         `).join('');
                         
-                        // Update stats
                         document.querySelector('#logContent').parentElement.previousElementSibling.querySelector('span').textContent = 
                             `Showing ${filteredLogs.length} lines`;
                         
-                        // Auto-scroll to bottom
                         if (autoScroll) {
                             container.scrollTop = container.scrollHeight;
                         }
@@ -2620,7 +2422,6 @@ def index():
                     .then(events => {
                         const container = document.getElementById('eventContent');
                         
-                        // Limit display if not expanded
                         let displayEvents = events;
                         if (!eventsExpanded && events.length > 100) {
                             displayEvents = events.slice(-100);
@@ -2643,7 +2444,6 @@ def index():
                             </div>
                         `).join('');
                         
-                        // Update stats
                         document.querySelector('#eventContent').parentElement.previousElementSibling.querySelector('span').textContent = 
                             `Showing ${displayEvents.length} events`;
                     });
@@ -2661,7 +2461,6 @@ def index():
             function setFilter(filter) {
                 currentFilter = filter;
                 
-                // Update badge states
                 document.querySelectorAll('.filter-badge').forEach(badge => {
                     badge.classList.remove('active');
                     if (badge.textContent === filter) {
@@ -2732,10 +2531,8 @@ def index():
                 return div.innerHTML;
             }
             
-            // Initialize auto-refresh
             toggleAutoRefresh();
             
-            // Handle scroll events
             document.getElementById('logContent').addEventListener('scroll', function() {
                 const container = this;
                 const isAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 10;
@@ -2744,14 +2541,12 @@ def index():
                 document.getElementById('scrollInfo').style.color = autoScroll ? '#00ff00' : '#ff0000';
             });
             
-            // Handle search box enter key
             document.getElementById('searchBox').addEventListener('keypress', function(e) {
                 if (e.key === 'Enter') {
                     filterLogs();
                 }
             });
             
-            // Initial load
             refreshLogs();
             refreshEvents();
         </script>
@@ -2979,7 +2774,6 @@ async def async_mcp_bridge():
             )
             
             logger.info(f"🔗 [MCP_BRIDGE] Connecting to Xiaozhi (reconnect delay: {reconnect_delay}s)...")
-            logger.debug(f"   • WebSocket URL: {XIAOZHI_WS[:50]}...")
             
             async with websockets.connect(
                 XIAOZHI_WS,
@@ -3001,12 +2795,8 @@ async def async_mcp_bridge():
                 )
                 
                 logger.info("✅ [MCP_BRIDGE] CONNECTED TO XIAOZHI")
-                logger.debug(f"   • WebSocket ID: {websocket_id}")
-                logger.debug(f"   • WebSocket open: {websocket.open}")
-                logger.debug(f"   • Ping interval: 15s")
-                logger.debug(f"   • Ping timeout: 10s")
                 
-                reconnect_delay = 1  # Reset reconnect delay on successful connection
+                reconnect_delay = 1
                 
                 async for raw_message in websocket:
                     receive_time = get_utc8_time()
@@ -3030,11 +2820,6 @@ async def async_mcp_bridge():
                         )
                         
                         logger.debug(f"📨 [MCP_BRIDGE] Received MCP message: {method}")
-                        logger.debug(f"   • Message ID: {message_id}")
-                        logger.debug(f"   • Method: {method}")
-                        logger.debug(f"   • Params keys: {list(params.keys())}")
-                        logger.debug(f"   • Message length: {len(raw_message)} chars")
-                        logger.debug(f"   • Receive time: {format_utc8_time_short(receive_time)}")
                         
                         response = None
                         
@@ -3096,8 +2881,6 @@ async def async_mcp_bridge():
                             )
                             
                             logger.debug(f"   • [MCP_BRIDGE] Response sent successfully")
-                            logger.debug(f"   • Send duration: {send_duration:.1f}ms")
-                            logger.debug(f"   • Response length: {len(json.dumps(response))} chars")
                             
                     except json.JSONDecodeError as e:
                         error_time = get_utc8_time()
@@ -3109,8 +2892,6 @@ async def async_mcp_bridge():
                         )
                         
                         logger.error(f"❌ [MCP_BRIDGE] JSON decode error: {e}")
-                        logger.debug(f"   • Error time: {format_utc8_time_short(error_time)}")
-                        logger.debug(f"   • Raw message: {raw_message[:100]}...")
                         
                     except Exception as e:
                         error_time = get_utc8_time()
@@ -3122,7 +2903,6 @@ async def async_mcp_bridge():
                         )
                         
                         logger.error(f"❌ [MCP_BRIDGE] Message processing error: {e}")
-                        logger.debug(f"   • Error time: {format_utc8_time_short(error_time)}")
                         logger.exception("Detailed error trace:")
                         
         except websockets.exceptions.ConnectionClosed as e:
@@ -3135,9 +2915,6 @@ async def async_mcp_bridge():
             )
             
             logger.error(f"❌ [MCP_BRIDGE] WebSocket connection closed: {e.code} - {e.reason}")
-            logger.debug(f"   • Error time: {format_utc8_time_short(error_time)}")
-            logger.debug(f"   • Close code: {e.code}")
-            logger.debug(f"   • Close reason: {e.reason}")
             
         except ConnectionRefusedError as e:
             error_time = get_utc8_time()
@@ -3148,7 +2925,6 @@ async def async_mcp_bridge():
             )
             
             logger.error(f"❌ [MCP_BRIDGE] Connection refused: {e}")
-            logger.debug(f"   • Error time: {format_utc8_time_short(error_time)}")
             
         except Exception as e:
             error_time = get_utc8_time()
@@ -3159,10 +2935,8 @@ async def async_mcp_bridge():
             )
             
             logger.error(f"❌ [MCP_BRIDGE] Connection error: {e}")
-            logger.debug(f"   • Error time: {format_utc8_time_short(error_time)}")
             logger.exception("Detailed error trace:")
             
-            # Clean up all ping tasks
             logger.debug("🧹 [MCP_BRIDGE] Cleaning up ping tasks due to connection error")
             
             event_tracker.add_system_event(
@@ -3181,7 +2955,6 @@ async def async_mcp_bridge():
             )
             
             logger.info(f"🔄 [MCP_BRIDGE] Reconnecting in {reconnect_delay}s...")
-            logger.debug(f"   • Next reconnect delay: {reconnect_delay}s")
             
             event_tracker.add_websocket_event(
                 "RECONNECT_SCHEDULED",
@@ -3190,7 +2963,7 @@ async def async_mcp_bridge():
             )
             
             await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 1.5, 5)  # Exponential backoff, max 5 seconds
+            reconnect_delay = min(reconnect_delay * 1.5, 5)
 
 async def main():
     """Main async entry point with detailed startup logging."""
@@ -3218,18 +2991,7 @@ async def main():
     )
     
     logger.info(f"🚀 [MAIN] Starting Xiaozhi MCP Server v3.6.2")
-    logger.debug(f"   • Startup time: {format_utc8_time(startup_time)}")
-    logger.debug(f"   • Timezone: UTC+8")
-    logger.debug(f"   • Log mode: UNLIMITED (no max length)")
-    logger.debug(f"   • First ping delay: {FIRST_PING_DELAY}s")
-    logger.debug(f"   • Continuous ping interval: {CONTINUOUS_PING_INTERVAL}s")
-    logger.debug(f"   • Parallel model tries: {PARALLEL_MODEL_TRIES}")
-    logger.debug(f"   • Max workers: {MAX_WORKERS}")
-    logger.debug(f"   • Gemini API key: {'✅ CONFIGURED' if GEMINI_API_KEY else '❌ MISSING'}")
-    logger.debug(f"   • Google API key: {'✅ CONFIGURED' if GOOGLE_API_KEY else '❌ MISSING'}")
-    logger.debug(f"   • Xiaozhi WebSocket: {'✅ CONFIGURED' if XIAOZHI_WS else '❌ MISSING'}")
     
-    # Start web server in background thread
     def run_web_server():
         event_tracker.add_system_event(
             "WEB_SERVER_START",
@@ -3244,14 +3006,8 @@ async def main():
     web_thread = threading.Thread(target=run_web_server, daemon=True)
     web_thread.start()
     
-    logger.debug(f"   • Web server thread ID: {web_thread.ident}")
-    logger.debug(f"   • Web server thread alive: {web_thread.is_alive()}")
-    logger.debug(f"   • Web server URL: http://0.0.0.0:3000/")
-    
-    # Give web server a moment to start
     await asyncio.sleep(1)
     
-    # Start MCP bridge
     event_tracker.add_system_event(
         "MCP_BRIDGE_START",
         "Starting MCP WebSocket bridge",
@@ -3275,7 +3031,6 @@ if __name__ == "__main__":
         )
         
         logger.info("\n👋 [MAIN] Server stopped by user")
-        logger.debug(f"   • Shutdown time: {format_utc8_time(shutdown_time)}")
         
         ping_manager.stop_all_pings()
         
@@ -3290,7 +3045,6 @@ if __name__ == "__main__":
         )
         
         logger.error(f"💥 [MAIN] Fatal error: {e}")
-        logger.debug(f"   • Crash time: {format_utc8_time(shutdown_time)}")
         logger.exception("Detailed error trace:")
-        
+        x = 1
         ping_manager.stop_all_pings()
