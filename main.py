@@ -3046,5 +3046,5 @@ if __name__ == "__main__":
         
         logger.error(f"💥 [MAIN] Fatal error: {e}")
         logger.exception("Detailed error trace:")
-        x = 1
+        
         ping_manager.stop_all_pings()
